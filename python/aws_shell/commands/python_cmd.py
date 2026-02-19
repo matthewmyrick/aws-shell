@@ -15,6 +15,9 @@ from pygments.lexers.python import Python3Lexer
 from pygments.token import Name
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
+
+from ..utils.table import ResourceTable
 
 console = Console()
 
@@ -30,23 +33,46 @@ PYTHON_STYLE = Style.from_dict({
 # Pre-loaded namespace variable names for syntax highlighting
 _NAMESPACE_NAMES = {
     "session", "boto3", "config",
-    # Raw clients
+    # Service clients (with helpers)
     "ec2", "s3", "iam", "lam", "cfn", "sts", "rds", "sqs", "ses",
     "opensearch", "route53", "ga_client", "cloudfront", "cw", "logs",
     "secrets", "dynamodb", "ssm_client", "ecs_client", "sso_admin",
     "elasticache", "cognito",
     # Utility functions
     "find", "client", "resource", "set_region", "set_profile",
-    # Helper functions
-    "list_instances", "list_vpcs", "list_subnets", "list_security_groups",
-    "list_buckets", "list_bucket_names", "list_functions",
-    "list_users", "list_roles", "list_policies", "list_stacks",
-    "list_queues", "list_db_instances", "list_db_clusters",
-    "list_domains", "list_hosted_zones", "list_distributions",
-    "list_alarms", "list_log_groups", "list_secrets",
-    "list_tables", "list_parameters", "list_clusters",
-    "list_cache_clusters", "list_user_pools",
 }
+
+
+class ServiceHelper:
+    """Wraps a boto3 client with convenience helper methods.
+
+    Direct client methods are available via delegation:
+        ec2.describe_instances(...)  # calls boto3 client
+
+    Helper methods provide simpler interfaces:
+        ec2.list_instances()  # returns ResourceTable
+    """
+
+    def __init__(self, name, client):
+        object.__setattr__(self, '_name', name)
+        object.__setattr__(self, '_client', client)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def __repr__(self):
+        helpers = sorted(
+            k for k in self.__dict__
+            if not k.startswith('_') and callable(self.__dict__[k])
+        )
+        if helpers:
+            return f"<{self._name} client — helpers: {', '.join(helpers)}>"
+        return f"<{self._name} client>"
+
+    def __dir__(self):
+        own = [k for k in self.__dict__ if not k.startswith('_')]
+        client_attrs = [a for a in dir(self._client) if not a.startswith('_')]
+        return sorted(set(own + client_attrs))
 
 
 class AWSPythonLexer(Python3Lexer):
@@ -62,6 +88,19 @@ class AWSPythonLexer(Python3Lexer):
                 yield index, tokentype, value
 
 
+
+# ResourceTable methods offered when chaining after a method call
+# e.g. ec2.list_instances().filter(...)
+_TABLE_METHODS = {
+    "filter": ("method", "Filter rows by key=value or lambda"),
+    "find": ("method", "Fuzzy search all fields"),
+    "sort": ("method", "Sort by column key"),
+    "select": ("method", "Choose display columns"),
+    "data": ("attr", "Raw list of dicts"),
+    "json": ("method", "Print as formatted JSON"),
+}
+
+
 class PythonCompleter(Completer):
     """Auto-completer that handles pre-loaded variables and Python attribute access."""
 
@@ -72,7 +111,6 @@ class PythonCompleter(Completer):
         text = document.text_before_cursor
 
         # Extract the current word being typed (the dotted expression at cursor)
-        # Walk backwards from cursor to find the start of the expression
         word = self._get_expression_at_cursor(text)
 
         if "." in word:
@@ -81,12 +119,17 @@ class PythonCompleter(Completer):
             obj_text = word[:dot_idx]
             partial = word[dot_idx + 1:]
 
+            # If obj_text ends with ), it's a method call return value.
+            # Don't eval (would call the API) — offer ResourceTable methods.
+            if obj_text.endswith(")"):
+                yield from self._complete_table_methods(partial)
+                return
+
             try:
                 obj = eval(obj_text, self.namespace)
                 attrs = [a for a in dir(obj) if not a.startswith("_")]
                 for attr in attrs:
                     if attr.lower().startswith(partial.lower()):
-                        # Add () suffix for callable attributes (methods/functions)
                         member = getattr(obj, attr, None)
                         if callable(member):
                             yield Completion(
@@ -119,7 +162,6 @@ class PythonCompleter(Completer):
                 if name.startswith("__"):
                     continue
                 if name.lower().startswith(partial.lower()):
-                    # Check if it's callable in the namespace
                     ns_val = self.namespace.get(name)
                     if ns_val is not None and callable(ns_val):
                         yield Completion(
@@ -132,14 +174,27 @@ class PythonCompleter(Completer):
                         yield Completion(name, start_position=-len(partial))
 
     @staticmethod
-    def _get_expression_at_cursor(text):
-        """Extract the dotted expression at the cursor position.
+    def _complete_table_methods(partial):
+        """Yield ResourceTable method completions for chained calls."""
+        for name, (kind, desc) in _TABLE_METHODS.items():
+            if name.lower().startswith(partial.lower()):
+                if kind == "method":
+                    yield Completion(
+                        name + "()",
+                        start_position=-len(partial),
+                        display=name + "()",
+                        display_meta=desc,
+                    )
+                else:
+                    yield Completion(
+                        name,
+                        start_position=-len(partial),
+                        display_meta=desc,
+                    )
 
-        For 'for x in s3.list' returns 's3.list'
-        For 'result = boto3.cl' returns 'boto3.cl'
-        For 'pri' returns 'pri'
-        """
-        # Walk backwards from end to find the start of the identifier/dotted expression
+    @staticmethod
+    def _get_expression_at_cursor(text):
+        """Extract the dotted expression at the cursor position."""
         i = len(text) - 1
         while i >= 0 and (text[i].isalnum() or text[i] in ("_", ".")):
             i -= 1
@@ -158,28 +213,37 @@ def cmd_python(args, config, session_manager):
         cmd_exec(args, config, session_manager)
         return
 
-    # Build the namespace with useful pre-loaded objects
     namespace = _build_namespace(config, session_manager)
     completer = PythonCompleter(namespace)
 
     console.print(
         Panel(
             "[bold]Python REPL Mode[/bold]\n\n"
-            "[bold]Clients:[/bold] ec2, s3, iam, lam, cfn, sts, rds, sqs, ses, opensearch,\n"
-            "  route53, ga_client, cloudfront, cw, logs, secrets, dynamodb,\n"
-            "  ssm_client, ecs_client, sso_admin, elasticache, cognito\n\n"
-            "[bold]Helpers[/bold] (return raw data):\n"
-            "  [cyan]list_instances()[/cyan]        [cyan]list_vpcs()[/cyan]           [cyan]list_subnets()[/cyan]\n"
-            "  [cyan]list_security_groups()[/cyan]  [cyan]list_buckets()[/cyan]        [cyan]list_bucket_names()[/cyan]\n"
-            "  [cyan]list_functions()[/cyan]        [cyan]list_users()[/cyan]          [cyan]list_roles()[/cyan]\n"
-            "  [cyan]list_policies()[/cyan]         [cyan]list_stacks()[/cyan]         [cyan]list_queues()[/cyan]\n"
-            "  [cyan]list_db_instances()[/cyan]     [cyan]list_db_clusters()[/cyan]    [cyan]list_domains()[/cyan]\n"
-            "  [cyan]list_hosted_zones()[/cyan]     [cyan]list_distributions()[/cyan]  [cyan]list_alarms()[/cyan]\n"
-            "  [cyan]list_log_groups()[/cyan]       [cyan]list_secrets()[/cyan]        [cyan]list_tables()[/cyan]\n"
-            "  [cyan]list_parameters()[/cyan]       [cyan]list_clusters()[/cyan]       [cyan]list_cache_clusters()[/cyan]\n"
-            "  [cyan]list_user_pools()[/cyan]\n\n"
+            "[bold]Clients[/bold] (type name to see helpers):\n"
+            "  [cyan]ec2[/cyan], [cyan]s3[/cyan], [cyan]iam[/cyan], [cyan]lam[/cyan], "
+            "[cyan]cfn[/cyan], [cyan]sts[/cyan], [cyan]rds[/cyan], [cyan]sqs[/cyan], "
+            "[cyan]ses[/cyan], [cyan]opensearch[/cyan],\n"
+            "  [cyan]route53[/cyan], [cyan]ga_client[/cyan], [cyan]cloudfront[/cyan], "
+            "[cyan]cw[/cyan], [cyan]logs[/cyan], [cyan]secrets[/cyan], [cyan]dynamodb[/cyan],\n"
+            "  [cyan]ssm_client[/cyan], [cyan]ecs_client[/cyan], [cyan]sso_admin[/cyan], "
+            "[cyan]elasticache[/cyan], [cyan]cognito[/cyan]\n\n"
+            "[bold]Examples:[/bold]\n"
+            "  [cyan]ec2.list_instances()[/cyan]                    "
+            "[dim]# Rich table output[/dim]\n"
+            "  [cyan]ec2.list_instances().filter(State=\"running\")[/cyan]  "
+            "[dim]# Filter rows[/dim]\n"
+            "  [cyan]ec2.list_instances().find(\"web\")[/cyan]           "
+            "[dim]# Fuzzy search[/dim]\n"
+            "  [cyan]ec2.list_instances().sort(\"Tags.Name\")[/cyan]     "
+            "[dim]# Sort by column[/dim]\n"
+            "  [cyan]ec2.list_instances().data[/cyan]                  "
+            "[dim]# Raw list of dicts[/dim]\n"
+            "  [cyan]ec2.list_instances().json()[/cyan]                "
+            "[dim]# JSON output[/dim]\n"
+            "  [cyan]ec2.describe_instances(InstanceIds=[...])[/cyan]  "
+            "[dim]# Direct boto3 call[/dim]\n\n"
             "[bold]Utilities:[/bold]\n"
-            "  [cyan]find(data, kw)[/cyan]    - Fuzzy search through JSON data\n"
+            "  [cyan]find(data, kw)[/cyan]    - Fuzzy search through any data\n"
             "  [cyan]client(name)[/cyan]      - Get any boto3 client\n"
             "  [cyan]resource(name)[/cyan]    - Get any boto3 resource\n"
             "  [cyan]set_region(name)[/cyan]  - Switch region (refreshes all clients)\n"
@@ -201,24 +265,19 @@ def cmd_python(args, config, session_manager):
         buf = event.current_buffer
         text = buf.text
 
-        # Empty input -> submit (becomes a no-op in the loop)
         if not text.strip():
             buf.validate_and_handle()
             return
 
-        # Try to compile — if None, code is incomplete, add a newline
         try:
             result = compiler(text, "<input>", "exec")
         except (SyntaxError, OverflowError, ValueError):
-            # Syntax error — submit so the user sees the error
             buf.validate_and_handle()
             return
 
         if result is None:
-            # Incomplete (e.g., open block, unterminated string) — add newline
             buf.insert_text("\n")
         else:
-            # Complete statement — submit
             buf.validate_and_handle()
 
     py_session = PromptSession(
@@ -233,22 +292,16 @@ def cmd_python(args, config, session_manager):
         prompt_continuation="... ",
     )
 
-    # The REPL loop
     while True:
         try:
             text = py_session.prompt(">>> ")
-
             stripped = text.strip()
             if not stripped:
                 continue
-
-            # Handle exit commands
             if stripped in ("exit", "exit()", "quit", "quit()"):
                 console.print("[dim]Returning to AWS Shell...[/dim]")
                 break
-
             _exec_python(text, namespace)
-
         except KeyboardInterrupt:
             console.print("\nKeyboardInterrupt")
             continue
@@ -262,11 +315,11 @@ def _exec_python(code_str, namespace):
     from ..utils.output import print_json
 
     try:
-        # Try as an expression first (returns a value)
         result = eval(compile(code_str, "<input>", "eval"), namespace)
         if result is not None:
-            # Pretty-print dicts/lists as JSON, fall back to repr for other types
-            if isinstance(result, (dict, list)):
+            if isinstance(result, ResourceTable):
+                result.render()
+            elif isinstance(result, (dict, list)):
                 try:
                     print_json(result)
                 except (TypeError, ValueError):
@@ -274,7 +327,6 @@ def _exec_python(code_str, namespace):
             else:
                 print(repr(result))
     except SyntaxError:
-        # Not an expression, execute as statement(s)
         try:
             exec(compile(code_str, "<input>", "exec"), namespace)
         except Exception:
@@ -286,7 +338,7 @@ def _exec_python(code_str, namespace):
 def cmd_exec(args, config, session_manager):
     if not args:
         console.print("[yellow]Usage:[/yellow] exec <python-expression>")
-        console.print("[dim]Example: exec boto3.client('s3').list_buckets()['Buckets'][/dim]")
+        console.print("[dim]Example: exec ec2.list_instances()[/dim]")
         return
 
     namespace = _build_namespace(config, session_manager)
@@ -295,11 +347,14 @@ def cmd_exec(args, config, session_manager):
     try:
         result = eval(expression, namespace)
         if result is not None:
-            from ..utils.output import print_json
-            try:
-                print_json(result)
-            except (TypeError, ValueError):
-                console.print(repr(result))
+            if isinstance(result, ResourceTable):
+                result.render()
+            else:
+                from ..utils.output import print_json
+                try:
+                    print_json(result)
+                except (TypeError, ValueError):
+                    console.print(repr(result))
     except SyntaxError:
         try:
             exec(expression, namespace)
@@ -334,266 +389,344 @@ def _build_namespace(config, session_manager):
         print(f"Profile set to: {profile}")
 
     def find(data, keyword):
-        """Fuzzy search through JSON data. Returns matching key paths and values."""
+        """Fuzzy search through data. For ResourceTables returns a filtered table."""
+        if isinstance(data, ResourceTable):
+            return data.find(keyword)
+
         results = fuzzy_search(data, keyword)
         if not results:
-            print(f"No matches for '{keyword}'")
-            return []
+            console.print(f"[yellow]No matches for '{keyword}'[/yellow]")
+            return
+
+        console.print()
         for path, value in results:
-            display = value if len(value) <= 100 else value[:97] + "..."
-            print(f"  {path}: {display}")
-        print(f"\n{len(results)} match(es)")
-        return results
-
-    # --- Helper functions that mirror shell commands but return raw data ---
-
-    def list_instances():
-        """List all EC2 instances. Returns list of instance dicts."""
-        c = session_manager.client("ec2")
-        instances = []
-        for page in c.get_paginator("describe_instances").paginate():
-            for res in page["Reservations"]:
-                instances.extend(res["Instances"])
-        return instances
-
-    def list_vpcs():
-        """List all VPCs. Returns list of VPC dicts."""
-        return session_manager.client("ec2").describe_vpcs()["Vpcs"]
-
-    def list_subnets(vpc_id=None):
-        """List subnets, optionally filtered by VPC ID."""
-        c = session_manager.client("ec2")
-        kwargs = {"Filters": [{"Name": "vpc-id", "Values": [vpc_id]}]} if vpc_id else {}
-        return c.describe_subnets(**kwargs)["Subnets"]
-
-    def list_security_groups(vpc_id=None):
-        """List security groups, optionally filtered by VPC ID."""
-        c = session_manager.client("ec2")
-        kwargs = {"Filters": [{"Name": "vpc-id", "Values": [vpc_id]}]} if vpc_id else {}
-        return c.describe_security_groups(**kwargs)["SecurityGroups"]
-
-    def list_buckets():
-        """List all S3 buckets. Returns list of bucket dicts."""
-        return session_manager.client("s3").list_buckets().get("Buckets", [])
-
-    def list_bucket_names():
-        """List just S3 bucket names. Returns list of strings."""
-        return [b["Name"] for b in list_buckets()]
-
-    def list_functions():
-        """List all Lambda functions. Returns list of function dicts."""
-        c = session_manager.client("lambda")
-        funcs = []
-        for page in c.get_paginator("list_functions").paginate():
-            funcs.extend(page["Functions"])
-        return funcs
-
-    def list_users():
-        """List all IAM users. Returns list of user dicts."""
-        c = session_manager.client("iam")
-        users = []
-        for page in c.get_paginator("list_users").paginate():
-            users.extend(page["Users"])
-        return users
-
-    def list_roles():
-        """List all IAM roles. Returns list of role dicts."""
-        c = session_manager.client("iam")
-        roles = []
-        for page in c.get_paginator("list_roles").paginate():
-            roles.extend(page["Roles"])
-        return roles
-
-    def list_policies():
-        """List customer-managed IAM policies. Returns list of policy dicts."""
-        c = session_manager.client("iam")
-        policies = []
-        for page in c.get_paginator("list_policies").paginate(Scope="Local"):
-            policies.extend(page["Policies"])
-        return policies
-
-    def list_stacks():
-        """List active CloudFormation stacks. Returns list of stack dicts."""
-        c = session_manager.client("cloudformation")
-        stacks = []
-        for page in c.get_paginator("list_stacks").paginate(
-            StackStatusFilter=["CREATE_COMPLETE", "UPDATE_COMPLETE", "ROLLBACK_COMPLETE"]
-        ):
-            stacks.extend(page.get("StackSummaries", []))
-        return stacks
-
-    def list_queues():
-        """List all SQS queue URLs. Returns list of URL strings."""
-        return session_manager.client("sqs").list_queues().get("QueueUrls", [])
-
-    def list_db_instances():
-        """List all RDS instances. Returns list of DB instance dicts."""
-        c = session_manager.client("rds")
-        instances = []
-        for page in c.get_paginator("describe_db_instances").paginate():
-            instances.extend(page["DBInstances"])
-        return instances
-
-    def list_db_clusters():
-        """List all RDS/Aurora clusters. Returns list of cluster dicts."""
-        c = session_manager.client("rds")
-        clusters = []
-        for page in c.get_paginator("describe_db_clusters").paginate():
-            clusters.extend(page["DBClusters"])
-        return clusters
-
-    def list_domains():
-        """List OpenSearch domain names. Returns list of domain dicts."""
-        return session_manager.client("opensearch").list_domain_names().get("DomainNames", [])
-
-    def list_hosted_zones():
-        """List Route 53 hosted zones. Returns list of zone dicts."""
-        return session_manager.client("route53").list_hosted_zones().get("HostedZones", [])
-
-    def list_distributions():
-        """List CloudFront distributions. Returns list of distribution dicts."""
-        resp = session_manager.client("cloudfront").list_distributions()
-        return resp.get("DistributionList", {}).get("Items", [])
-
-    def list_alarms():
-        """List CloudWatch alarms. Returns list of alarm dicts."""
-        c = session_manager.client("cloudwatch")
-        alarms = []
-        for page in c.get_paginator("describe_alarms").paginate():
-            alarms.extend(page.get("MetricAlarms", []))
-        return alarms
-
-    def list_log_groups():
-        """List CloudWatch log groups. Returns list of log group dicts."""
-        c = session_manager.client("logs")
-        groups = []
-        for page in c.get_paginator("describe_log_groups").paginate():
-            groups.extend(page.get("logGroups", []))
-        return groups
-
-    def list_secrets():
-        """List Secrets Manager secrets (metadata only). Returns list of secret dicts."""
-        c = session_manager.client("secretsmanager")
-        secs = []
-        for page in c.get_paginator("list_secrets").paginate():
-            secs.extend(page.get("SecretList", []))
-        return secs
-
-    def list_tables():
-        """List DynamoDB table names. Returns list of name strings."""
-        return session_manager.client("dynamodb").list_tables().get("TableNames", [])
-
-    def list_parameters():
-        """List SSM parameters. Returns list of parameter dicts."""
-        c = session_manager.client("ssm")
-        params = []
-        for page in c.get_paginator("describe_parameters").paginate():
-            params.extend(page.get("Parameters", []))
-        return params
-
-    def list_clusters():
-        """List ECS cluster ARNs. Returns list of ARN strings."""
-        return session_manager.client("ecs").list_clusters().get("clusterArns", [])
-
-    def list_cache_clusters():
-        """List ElastiCache clusters. Returns list of cluster dicts."""
-        c = session_manager.client("elasticache")
-        clusters = []
-        for page in c.get_paginator("describe_cache_clusters").paginate():
-            clusters.extend(page.get("CacheClusters", []))
-        return clusters
-
-    def list_user_pools():
-        """List Cognito user pools. Returns list of pool dicts."""
-        return session_manager.client("cognito-idp").list_user_pools(MaxResults=60).get("UserPools", [])
+            text = Text()
+            text.append(f"  {path}", style="cyan")
+            text.append(" \u2192 ", style="dim")
+            display = value if len(value) <= 120 else value[:117] + "..."
+            text.append(display)
+            console.print(text)
+        console.print(f"\n[dim]{len(results)} match(es)[/dim]")
 
     namespace.update({
         "__builtins__": __builtins__,
         "boto3": boto3,
         "session": session_manager._session,
         "config": config,
-        # Raw clients
-        "ec2": session_manager.client("ec2"),
-        "s3": session_manager.client("s3"),
-        "iam": session_manager.client("iam"),
-        "lam": session_manager.client("lambda"),
-        "cfn": session_manager.client("cloudformation"),
-        "sts": session_manager.client("sts"),
-        "rds": session_manager.client("rds"),
-        "sqs": session_manager.client("sqs"),
-        "ses": session_manager.client("sesv2"),
-        "opensearch": session_manager.client("opensearch"),
-        "route53": session_manager.client("route53"),
-        "ga_client": session_manager.client("globalaccelerator"),
-        "cloudfront": session_manager.client("cloudfront"),
-        "cw": session_manager.client("cloudwatch"),
-        "logs": session_manager.client("logs"),
-        "secrets": session_manager.client("secretsmanager"),
-        "dynamodb": session_manager.client("dynamodb"),
-        "ssm_client": session_manager.client("ssm"),
-        "ecs_client": session_manager.client("ecs"),
-        "sso_admin": session_manager.client("sso-admin"),
-        "elasticache": session_manager.client("elasticache"),
-        "cognito": session_manager.client("cognito-idp"),
         # Utility functions
         "find": find,
         "client": get_client,
         "resource": get_resource,
         "set_region": set_region,
         "set_profile": set_profile,
-        # Helper functions (return raw data)
-        "list_instances": list_instances,
-        "list_vpcs": list_vpcs,
-        "list_subnets": list_subnets,
-        "list_security_groups": list_security_groups,
-        "list_buckets": list_buckets,
-        "list_bucket_names": list_bucket_names,
-        "list_functions": list_functions,
-        "list_users": list_users,
-        "list_roles": list_roles,
-        "list_policies": list_policies,
-        "list_stacks": list_stacks,
-        "list_queues": list_queues,
-        "list_db_instances": list_db_instances,
-        "list_db_clusters": list_db_clusters,
-        "list_domains": list_domains,
-        "list_hosted_zones": list_hosted_zones,
-        "list_distributions": list_distributions,
-        "list_alarms": list_alarms,
-        "list_log_groups": list_log_groups,
-        "list_secrets": list_secrets,
-        "list_tables": list_tables,
-        "list_parameters": list_parameters,
-        "list_clusters": list_clusters,
-        "list_cache_clusters": list_cache_clusters,
-        "list_user_pools": list_user_pools,
     })
+
+    _attach_service_helpers(namespace, session_manager)
 
     return namespace
 
 
+# ---------------------------------------------------------------------------
+# Helper factories for concise service helper creation
+# ---------------------------------------------------------------------------
+
+def _paginated_helper(sm, service, method, key, columns=None, title=None, **extra):
+    """Factory: create a helper that paginates an API call and returns ResourceTable."""
+    def helper():
+        c = sm.client(service)
+        items = []
+        for page in c.get_paginator(method).paginate(**extra):
+            items.extend(page.get(key, []))
+        return ResourceTable(items, columns=columns, title=title)
+    return helper
+
+
+def _simple_helper(sm, service, method, key_path, columns=None, title=None, **call_kwargs):
+    """Factory: create a helper that makes a single API call and returns ResourceTable."""
+    def helper():
+        c = sm.client(service)
+        result = getattr(c, method)(**call_kwargs)
+        data = result
+        for k in key_path.split("."):
+            data = data.get(k, []) if isinstance(data, dict) else data
+        if not isinstance(data, list):
+            data = [data] if data else []
+        return ResourceTable(data, columns=columns, title=title)
+    return helper
+
+
+# ---------------------------------------------------------------------------
+# Service helpers — each service gets a ServiceHelper with attached methods
+# ---------------------------------------------------------------------------
+
+def _attach_service_helpers(namespace, session_manager):
+    """Create ServiceHelper objects with convenience methods for all services."""
+    sm = session_manager
+
+    # --- EC2 ---
+    ec2 = ServiceHelper("ec2", sm.client("ec2"))
+
+    def _ec2_list_instances():
+        c = sm.client("ec2")
+        instances = []
+        for page in c.get_paginator("describe_instances").paginate():
+            for res in page["Reservations"]:
+                instances.extend(res["Instances"])
+        return ResourceTable(instances, columns=[
+            ("InstanceId", "Instance ID", "cyan"),
+            ("Tags.Name", "Name", "green"),
+            ("State.Name", "State", "bold"),
+            ("InstanceType", "Type", "yellow"),
+            ("PrivateIpAddress", "Private IP"),
+            ("PublicIpAddress", "Public IP"),
+        ], title="EC2 Instances")
+
+    def _ec2_list_vpcs():
+        return ResourceTable(
+            sm.client("ec2").describe_vpcs()["Vpcs"],
+            columns=[("VpcId", "VPC ID", "cyan"), ("Tags.Name", "Name", "green"),
+                     ("State", "State", "bold"), ("CidrBlock", "CIDR", "yellow"),
+                     ("IsDefault", "Default")],
+            title="VPCs",
+        )
+
+    def _ec2_list_subnets(vpc_id=None):
+        c = sm.client("ec2")
+        kwargs = {"Filters": [{"Name": "vpc-id", "Values": [vpc_id]}]} if vpc_id else {}
+        return ResourceTable(
+            c.describe_subnets(**kwargs)["Subnets"],
+            columns=[("SubnetId", "Subnet ID", "cyan"), ("Tags.Name", "Name", "green"),
+                     ("VpcId", "VPC ID", "cyan"), ("CidrBlock", "CIDR", "yellow"),
+                     ("AvailabilityZone", "AZ")],
+            title="Subnets",
+        )
+
+    def _ec2_list_security_groups(vpc_id=None):
+        c = sm.client("ec2")
+        kwargs = {"Filters": [{"Name": "vpc-id", "Values": [vpc_id]}]} if vpc_id else {}
+        return ResourceTable(
+            c.describe_security_groups(**kwargs)["SecurityGroups"],
+            columns=[("GroupId", "Group ID", "cyan"), ("GroupName", "Name", "green"),
+                     ("VpcId", "VPC ID", "cyan"), ("Description", "Description")],
+            title="Security Groups",
+        )
+
+    ec2.list_instances = _ec2_list_instances
+    ec2.list_vpcs = _ec2_list_vpcs
+    ec2.list_subnets = _ec2_list_subnets
+    ec2.list_security_groups = _ec2_list_security_groups
+    namespace["ec2"] = ec2
+
+    # --- S3 ---
+    s3 = ServiceHelper("s3", sm.client("s3"))
+
+    def _s3_list_buckets():
+        return ResourceTable(
+            sm.client("s3").list_buckets().get("Buckets", []),
+            columns=[("Name", "Bucket Name"), ("CreationDate", "Created")],
+            title="S3 Buckets",
+        )
+
+    def _s3_list_bucket_names():
+        buckets = sm.client("s3").list_buckets().get("Buckets", [])
+        return ResourceTable(
+            [b["Name"] for b in buckets],
+            title="S3 Bucket Names",
+        )
+
+    s3.list_buckets = _s3_list_buckets
+    s3.list_bucket_names = _s3_list_bucket_names
+    namespace["s3"] = s3
+
+    # --- IAM ---
+    iam = ServiceHelper("iam", sm.client("iam"))
+    iam.list_users = _paginated_helper(sm, "iam", "list_users", "Users",
+        columns=[("UserName", "User"), ("UserId", "User ID"),
+                 ("Arn", "ARN"), ("CreateDate", "Created")],
+        title="IAM Users")
+    iam.list_roles = _paginated_helper(sm, "iam", "list_roles", "Roles",
+        columns=[("RoleName", "Role"), ("RoleId", "Role ID"),
+                 ("Arn", "ARN"), ("CreateDate", "Created")],
+        title="IAM Roles")
+    iam.list_policies = _paginated_helper(sm, "iam", "list_policies", "Policies",
+        columns=[("PolicyName", "Policy"), ("PolicyId", "Policy ID"),
+                 ("AttachmentCount", "Attachments"), ("CreateDate", "Created")],
+        title="IAM Policies", Scope="Local")
+    namespace["iam"] = iam
+
+    # --- Lambda ---
+    lam = ServiceHelper("lambda", sm.client("lambda"))
+    lam.list_functions = _paginated_helper(sm, "lambda", "list_functions", "Functions",
+        columns=[("FunctionName", "Function"), ("Runtime", "Runtime"),
+                 ("MemorySize", "Memory MB"), ("Timeout", "Timeout"),
+                 ("LastModified", "Last Modified")],
+        title="Lambda Functions")
+    namespace["lam"] = lam
+
+    # --- CloudFormation ---
+    cfn = ServiceHelper("cfn", sm.client("cloudformation"))
+    cfn.list_stacks = _paginated_helper(
+        sm, "cloudformation", "list_stacks", "StackSummaries",
+        columns=[("StackName", "Stack"), ("StackStatus", "Status"),
+                 ("CreationTime", "Created")],
+        title="CloudFormation Stacks",
+        StackStatusFilter=["CREATE_COMPLETE", "UPDATE_COMPLETE", "ROLLBACK_COMPLETE"])
+    namespace["cfn"] = cfn
+
+    # --- STS (no helpers) ---
+    namespace["sts"] = ServiceHelper("sts", sm.client("sts"))
+
+    # --- RDS ---
+    rds = ServiceHelper("rds", sm.client("rds"))
+    rds.list_instances = _paginated_helper(
+        sm, "rds", "describe_db_instances", "DBInstances",
+        columns=[("DBInstanceIdentifier", "DB Instance"), ("DBInstanceClass", "Class"),
+                 ("Engine", "Engine"), ("DBInstanceStatus", "Status")],
+        title="RDS Instances")
+    rds.list_clusters = _paginated_helper(
+        sm, "rds", "describe_db_clusters", "DBClusters",
+        columns=[("DBClusterIdentifier", "Cluster"), ("Engine", "Engine"),
+                 ("Status", "Status"), ("Endpoint", "Endpoint")],
+        title="RDS Clusters")
+    namespace["rds"] = rds
+
+    # --- SQS ---
+    sqs = ServiceHelper("sqs", sm.client("sqs"))
+
+    def _sqs_list_queues():
+        return ResourceTable(
+            sm.client("sqs").list_queues().get("QueueUrls", []),
+            title="SQS Queues",
+        )
+
+    sqs.list_queues = _sqs_list_queues
+    namespace["sqs"] = sqs
+
+    # --- SES (no helpers) ---
+    namespace["ses"] = ServiceHelper("ses", sm.client("sesv2"))
+
+    # --- OpenSearch ---
+    opensearch = ServiceHelper("opensearch", sm.client("opensearch"))
+    opensearch.list_domains = _simple_helper(
+        sm, "opensearch", "list_domain_names", "DomainNames",
+        columns=[("DomainName", "Domain")],
+        title="OpenSearch Domains")
+    namespace["opensearch"] = opensearch
+
+    # --- Route 53 ---
+    route53 = ServiceHelper("route53", sm.client("route53"))
+    route53.list_hosted_zones = _simple_helper(
+        sm, "route53", "list_hosted_zones", "HostedZones",
+        columns=[("Name", "Name"), ("Id", "Zone ID"),
+                 ("ResourceRecordSetCount", "Records")],
+        title="Route 53 Hosted Zones")
+    namespace["route53"] = route53
+
+    # --- Global Accelerator (no helpers) ---
+    namespace["ga_client"] = ServiceHelper("ga", sm.client("globalaccelerator"))
+
+    # --- CloudFront ---
+    cloudfront = ServiceHelper("cloudfront", sm.client("cloudfront"))
+
+    def _cf_list_distributions():
+        resp = sm.client("cloudfront").list_distributions()
+        items = resp.get("DistributionList", {}).get("Items", [])
+        return ResourceTable(items,
+            columns=[("Id", "ID"), ("DomainName", "Domain"),
+                     ("Status", "Status"), ("Enabled", "Enabled")],
+            title="CloudFront Distributions")
+
+    cloudfront.list_distributions = _cf_list_distributions
+    namespace["cloudfront"] = cloudfront
+
+    # --- CloudWatch ---
+    cw = ServiceHelper("cw", sm.client("cloudwatch"))
+    cw.list_alarms = _paginated_helper(
+        sm, "cloudwatch", "describe_alarms", "MetricAlarms",
+        columns=[("AlarmName", "Alarm"), ("StateValue", "State"),
+                 ("MetricName", "Metric"), ("Namespace", "Namespace")],
+        title="CloudWatch Alarms")
+    namespace["cw"] = cw
+
+    # --- CloudWatch Logs ---
+    logs = ServiceHelper("logs", sm.client("logs"))
+    logs.list_log_groups = _paginated_helper(
+        sm, "logs", "describe_log_groups", "logGroups",
+        columns=[("logGroupName", "Log Group"), ("storedBytes", "Stored Bytes"),
+                 ("retentionInDays", "Retention")],
+        title="CloudWatch Log Groups")
+    namespace["logs"] = logs
+
+    # --- Secrets Manager ---
+    secrets = ServiceHelper("secrets", sm.client("secretsmanager"))
+    secrets.list_secrets = _paginated_helper(
+        sm, "secretsmanager", "list_secrets", "SecretList",
+        columns=[("Name", "Secret"), ("Description", "Description"),
+                 ("LastChangedDate", "Last Changed")],
+        title="Secrets Manager")
+    namespace["secrets"] = secrets
+
+    # --- DynamoDB ---
+    dynamodb = ServiceHelper("dynamodb", sm.client("dynamodb"))
+
+    def _ddb_list_tables():
+        return ResourceTable(
+            sm.client("dynamodb").list_tables().get("TableNames", []),
+            title="DynamoDB Tables",
+        )
+
+    dynamodb.list_tables = _ddb_list_tables
+    namespace["dynamodb"] = dynamodb
+
+    # --- SSM ---
+    ssm_client = ServiceHelper("ssm", sm.client("ssm"))
+    ssm_client.list_parameters = _paginated_helper(
+        sm, "ssm", "describe_parameters", "Parameters",
+        columns=[("Name", "Parameter"), ("Type", "Type"),
+                 ("LastModifiedDate", "Last Modified")],
+        title="SSM Parameters")
+    namespace["ssm_client"] = ssm_client
+
+    # --- ECS ---
+    ecs_client = ServiceHelper("ecs", sm.client("ecs"))
+
+    def _ecs_list_clusters():
+        return ResourceTable(
+            sm.client("ecs").list_clusters().get("clusterArns", []),
+            title="ECS Clusters",
+        )
+
+    ecs_client.list_clusters = _ecs_list_clusters
+    namespace["ecs_client"] = ecs_client
+
+    # --- SSO Admin (no helpers) ---
+    namespace["sso_admin"] = ServiceHelper("sso", sm.client("sso-admin"))
+
+    # --- ElastiCache ---
+    elasticache = ServiceHelper("elasticache", sm.client("elasticache"))
+    elasticache.list_clusters = _paginated_helper(
+        sm, "elasticache", "describe_cache_clusters", "CacheClusters",
+        columns=[("CacheClusterId", "Cluster ID"), ("CacheNodeType", "Node Type"),
+                 ("Engine", "Engine"), ("CacheClusterStatus", "Status")],
+        title="ElastiCache Clusters")
+    namespace["elasticache"] = elasticache
+
+    # --- Cognito ---
+    cognito = ServiceHelper("cognito", sm.client("cognito-idp"))
+
+    def _cog_list_user_pools():
+        return ResourceTable(
+            sm.client("cognito-idp").list_user_pools(MaxResults=60).get("UserPools", []),
+            columns=[("Id", "Pool ID"), ("Name", "Name"),
+                     ("Status", "Status"), ("CreationDate", "Created")],
+            title="Cognito User Pools",
+        )
+
+    cognito.list_user_pools = _cog_list_user_pools
+    namespace["cognito"] = cognito
+
+
 def _refresh_clients(namespace, session_manager):
-    """Refresh pre-loaded clients after a region/profile switch."""
+    """Refresh all clients and service helpers after a region/profile switch."""
     namespace["session"] = session_manager._session
-    namespace["ec2"] = session_manager.client("ec2")
-    namespace["s3"] = session_manager.client("s3")
-    namespace["iam"] = session_manager.client("iam")
-    namespace["lam"] = session_manager.client("lambda")
-    namespace["cfn"] = session_manager.client("cloudformation")
-    namespace["sts"] = session_manager.client("sts")
-    namespace["rds"] = session_manager.client("rds")
-    namespace["sqs"] = session_manager.client("sqs")
-    namespace["ses"] = session_manager.client("sesv2")
-    namespace["opensearch"] = session_manager.client("opensearch")
-    namespace["route53"] = session_manager.client("route53")
-    namespace["ga_client"] = session_manager.client("globalaccelerator")
-    namespace["cloudfront"] = session_manager.client("cloudfront")
-    namespace["cw"] = session_manager.client("cloudwatch")
-    namespace["logs"] = session_manager.client("logs")
-    namespace["secrets"] = session_manager.client("secretsmanager")
-    namespace["dynamodb"] = session_manager.client("dynamodb")
-    namespace["ssm_client"] = session_manager.client("ssm")
-    namespace["ecs_client"] = session_manager.client("ecs")
-    namespace["sso_admin"] = session_manager.client("sso-admin")
-    namespace["elasticache"] = session_manager.client("elasticache")
-    namespace["cognito"] = session_manager.client("cognito-idp")
+    _attach_service_helpers(namespace, session_manager)
