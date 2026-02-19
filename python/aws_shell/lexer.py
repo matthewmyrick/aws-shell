@@ -24,7 +24,7 @@ SUBCOMMANDS = (
     "list-parameters", "get-parameter",
     "list-services", "list-tasks",
     "list-permission-sets",
-    "list-replication-groups",
+    "list-replication-groups", "list-serverless",
     "list-user-pools", "describe-user-pool",
     "get-config",
     "use-profile", "set-region", "set-output",
@@ -34,10 +34,11 @@ COMMANDS = (
     "ec2", "vpc", "s3", "lambda", "iam", "sts", "cfn",
     "ses", "sqs", "rds", "opensearch", "route53",
     "ga", "cloudfront", "cw", "secrets", "dynamodb",
-    "ssm", "ecs", "sso", "elasticache", "cognito",
-    "search",
+    "ssm", "ecs", "sso", "cache", "cognito",
+    "search", "ai",
     "help", "whoami", "clear", "exit", "quit", "services",
     "py", "python", "exec",
+    "set-config", "show-config",
 )
 
 

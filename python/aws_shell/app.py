@@ -1,6 +1,7 @@
 """Main AWS Shell application - the REPL loop."""
 import os
 import shlex
+import threading
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -18,8 +19,8 @@ from .utils.aws_session import AWSSessionManager
 
 
 class AWSShell:
-    def __init__(self):
-        self.config = ShellConfig()
+    def __init__(self, config_path=None):
+        self.config = ShellConfig(config_path=config_path)
         self.session_manager = AWSSessionManager(self.config)
         self.registry = CommandRegistry(self.config, self.session_manager)
         self.completer = build_completer(self.registry, self.session_manager)
@@ -33,6 +34,22 @@ class AWSShell:
             auto_suggest=AutoSuggestFromHistory(),
             complete_while_typing=True,
         )
+
+        # Background-initialize AI conversation (loads docs + builds system prompt)
+        self._init_ai_background()
+
+    def _init_ai_background(self):
+        """Spawn a daemon thread to pre-build the AI system prompt."""
+        from .commands.ai_cmd import _init_conversation_background
+
+        def _init():
+            try:
+                _init_conversation_background(self.config, self.session_manager)
+            except Exception:
+                pass  # Non-critical — will be retried lazily on first `ai` call
+
+        t = threading.Thread(target=_init, daemon=True)
+        t.start()
 
     def run(self):
         show_welcome(self.config, self.session_manager)

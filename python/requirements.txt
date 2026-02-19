@@ -2,3 +2,5 @@ boto3>=1.34.0
 prompt-toolkit>=3.0.43
 Pygments>=2.17.0
 rich>=13.7.0
+anthropic>=0.40.0
+pyyaml>=6.0

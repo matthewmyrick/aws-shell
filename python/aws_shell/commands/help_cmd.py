@@ -181,13 +181,15 @@ SERVICE_HELP = {
             "sso get-config <instance-arn>": "Get permission set configs as JSON",
         },
     },
-    "elasticache": {
-        "description": "ElastiCache",
+    "cache": {
+        "description": "Caching (ElastiCache)",
         "commands": {
-            "elasticache list-clusters": "List all cache clusters",
-            "elasticache describe-cluster <id>": "Show cluster details",
-            "elasticache list-replication-groups": "List replication groups",
-            "elasticache get-config <id>": "Get full cluster config as JSON",
+            "cache list": "List all caches (clusters, replication groups, serverless)",
+            "cache list-clusters": "List traditional cache clusters",
+            "cache list-replication-groups": "List replication groups",
+            "cache list-serverless": "List serverless caches",
+            "cache describe <id>": "Describe a cache by ID (auto-detects type)",
+            "cache get-config <id>": "Get full cache config as JSON",
         },
     },
     "cognito": {
@@ -221,6 +223,13 @@ SERVICE_HELP = {
             ">>> find(data, kw)": "Fuzzy search through any JSON data",
         },
     },
+    "ai": {
+        "description": "AI assistant powered by Claude",
+        "commands": {
+            "ai <question>": "Ask a question about AWS — get answers with suggested commands",
+            "ai clear": "Clear conversation history and start fresh",
+        },
+    },
     "general": {
         "description": "General shell commands",
         "commands": {
@@ -229,6 +238,8 @@ SERVICE_HELP = {
             "use-profile <name>": "Switch AWS profile",
             "set-region <region>": "Switch AWS region",
             "set-output <format>": "Set output format (table|json|text)",
+            "set-config <key> <value>": "Set a config value (e.g. llm.api_key)",
+            "show-config": "Show all config values",
             "clear": "Clear the terminal",
             "exit / quit": "Exit the shell",
         },
@@ -277,7 +288,7 @@ def cmd_help(args, config, session_manager):
     table.add_row("ssm", "Systems Manager", "ssm list-parameters")
     table.add_row("ecs", "Elastic Container Service", "ecs list-clusters")
     table.add_row("sso", "SSO Admin", "sso list-instances")
-    table.add_row("elasticache", "ElastiCache", "elasticache list-clusters")
+    table.add_row("cache", "Caching (ElastiCache)", "cache list")
     table.add_row("cognito", "Cognito User Pools", "cognito list-user-pools")
     table.add_row("", "", "")
     table.add_row("search", "Fuzzy search resource configs", "search ec2 i-abc subnet")
@@ -285,11 +296,15 @@ def cmd_help(args, config, session_manager):
     table.add_row("py / python", "Python REPL (boto3 pre-loaded)", "py")
     table.add_row("exec", "Run a Python expression", "exec s3.list_buckets()")
     table.add_row("", "", "")
+    table.add_row("ai", "Ask AI about AWS", "ai list running EC2 instances")
+    table.add_row("", "", "")
     table.add_row("whoami", "Show current identity", "whoami")
     table.add_row("services", "List AWS services", "services")
     table.add_row("use-profile", "Switch AWS profile", "use-profile staging")
     table.add_row("set-region", "Switch AWS region", "set-region us-west-2")
     table.add_row("set-output", "Set output format", "set-output json")
+    table.add_row("set-config", "Set a config value", "set-config llm.model ...")
+    table.add_row("show-config", "Show all config values", "show-config")
     table.add_row("clear", "Clear terminal", "clear")
     table.add_row("exit", "Exit the shell", "exit")
 

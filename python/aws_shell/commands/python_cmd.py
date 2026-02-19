@@ -34,20 +34,65 @@ PYTHON_STYLE = Style.from_dict({
 _NAMESPACE_NAMES = {
     "session", "boto3", "config",
     # Service clients (with helpers)
-    "ec2", "s3", "iam", "lam", "cfn", "sts", "rds", "sqs", "ses",
+    "ec2", "vpc", "asg", "s3", "iam", "lam", "cfn", "sts", "rds", "sqs", "ses",
     "opensearch", "route53", "ga_client", "cloudfront", "cw", "logs",
     "secrets", "dynamodb", "ssm_client", "ecs_client", "sso_admin",
-    "elasticache", "cognito",
+    "cache", "cognito",
     # Utility functions
-    "find", "client", "resource", "set_region", "set_profile",
+    "find", "docs", "raw", "client", "resource", "set_region", "set_profile",
+    "ai",
 }
+
+
+def _auto_table(response):
+    """Convert a boto3 response dict into a ResourceTable when possible.
+
+    Strips ResponseMetadata and looks for the largest list of dicts in the
+    response.  If found, wraps it in a ResourceTable for automatic table
+    rendering.  Otherwise returns the cleaned dict as-is.
+    """
+    if not isinstance(response, dict):
+        return response
+
+    # Strip metadata
+    cleaned = {k: v for k, v in response.items() if k != "ResponseMetadata"}
+
+    # Find the best list of dicts in the response
+    best_key = None
+    best_list = None
+    for key, value in cleaned.items():
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            if best_list is None or len(value) > len(best_list):
+                best_key = key
+                best_list = value
+        # Handle nested: e.g. DistributionList -> Items
+        elif isinstance(value, dict):
+            for subkey, subval in value.items():
+                if isinstance(subval, list) and subval and isinstance(subval[0], dict):
+                    if best_list is None or len(subval) > len(best_list):
+                        best_key = f"{key}.{subkey}"
+                        best_list = subval
+
+    if best_list is not None:
+        return ResourceTable(best_list, title=best_key)
+
+    # If there's a simple list of strings/numbers (like QueueUrls, clusterArns)
+    for key, value in cleaned.items():
+        if isinstance(value, list) and value and not isinstance(value[0], dict):
+            return ResourceTable(value, title=key)
+
+    # Single-item responses: return the cleaned dict directly
+    if len(cleaned) == 1:
+        return list(cleaned.values())[0]
+
+    return cleaned
 
 
 class ServiceHelper:
     """Wraps a boto3 client with convenience helper methods.
 
     Direct client methods are available via delegation:
-        ec2.describe_instances(...)  # calls boto3 client
+        ec2.describe_instances(...)  # calls boto3 client → auto-table
 
     Helper methods provide simpler interfaces:
         ec2.list_instances()  # returns ResourceTable
@@ -58,7 +103,17 @@ class ServiceHelper:
         object.__setattr__(self, '_client', client)
 
     def __getattr__(self, name):
-        return getattr(self._client, name)
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def wrapper(*args, **kwargs):
+            result = attr(*args, **kwargs)
+            return _auto_table(result)
+
+        wrapper.__name__ = name
+        wrapper.__doc__ = getattr(attr, '__doc__', None)
+        return wrapper
 
     def __repr__(self):
         helpers = sorted(
@@ -98,6 +153,8 @@ _TABLE_METHODS = {
     "select": ("method", "Choose display columns"),
     "data": ("attr", "Raw list of dicts"),
     "json": ("method", "Print as formatted JSON"),
+    "help": ("method", "Show all table methods"),
+    "docs": ("attr", "Show docs for this method"),
 }
 
 
@@ -119,36 +176,54 @@ class PythonCompleter(Completer):
             obj_text = word[:dot_idx]
             partial = word[dot_idx + 1:]
 
-            # If obj_text ends with ), it's a method call return value.
-            # Don't eval (would call the API) — offer ResourceTable methods.
-            if obj_text.endswith(")"):
+            # Detect chained method calls: something().partial
+            # _get_expression_at_cursor stops at ), so check if the char
+            # just before our extracted word is ) or obj_text ends with )
+            preceding_idx = len(text) - len(word) - 1
+            is_chained = (
+                obj_text.endswith(")")
+                or (preceding_idx >= 0 and text[preceding_idx] == ")")
+            )
+            if is_chained:
                 yield from self._complete_table_methods(partial)
                 return
 
             try:
                 obj = eval(obj_text, self.namespace)
                 attrs = [a for a in dir(obj) if not a.startswith("_")]
+                partial_lower = partial.lower()
+
+                # Split into prefix matches (shown first) and contains matches
+                prefix_matches = []
+                contains_matches = []
                 for attr in attrs:
-                    if attr.lower().startswith(partial.lower()):
-                        member = getattr(obj, attr, None)
-                        if callable(member):
-                            yield Completion(
-                                attr + "()",
-                                start_position=-len(partial),
-                                display=attr + "()",
-                                display_meta="method",
-                            )
-                        else:
-                            yield Completion(
-                                attr,
-                                start_position=-len(partial),
-                                display_meta="attr",
-                            )
+                    attr_lower = attr.lower()
+                    if attr_lower.startswith(partial_lower):
+                        prefix_matches.append(attr)
+                    elif partial_lower in attr_lower:
+                        contains_matches.append(attr)
+
+                for attr in prefix_matches + contains_matches:
+                    member = getattr(obj, attr, None)
+                    if callable(member):
+                        yield Completion(
+                            attr + "()",
+                            start_position=-len(partial),
+                            display=attr + "()",
+                            display_meta="method",
+                        )
+                    else:
+                        yield Completion(
+                            attr,
+                            start_position=-len(partial),
+                            display_meta="attr",
+                        )
             except Exception:
                 return
         else:
             # Complete from namespace keys + Python builtins
             partial = word
+            partial_lower = partial.lower()
             candidates = list(self.namespace.keys())
             candidates += ["True", "False", "None", "print", "len", "type",
                            "list", "dict", "str", "int", "float", "bool",
@@ -158,20 +233,30 @@ class PythonCompleter(Completer):
                            "while", "if", "else", "elif", "try", "except",
                            "with", "as", "def", "class", "return", "yield",
                            "lambda", "and", "or", "not", "in", "is"]
+
+            # Split into prefix matches (shown first) and contains matches
+            prefix_matches = []
+            contains_matches = []
             for name in candidates:
                 if name.startswith("__"):
                     continue
-                if name.lower().startswith(partial.lower()):
-                    ns_val = self.namespace.get(name)
-                    if ns_val is not None and callable(ns_val):
-                        yield Completion(
-                            name + "()",
-                            start_position=-len(partial),
-                            display=name + "()",
-                            display_meta="func",
-                        )
-                    else:
-                        yield Completion(name, start_position=-len(partial))
+                name_lower = name.lower()
+                if name_lower.startswith(partial_lower):
+                    prefix_matches.append(name)
+                elif partial_lower in name_lower:
+                    contains_matches.append(name)
+
+            for name in prefix_matches + contains_matches:
+                ns_val = self.namespace.get(name)
+                if ns_val is not None and callable(ns_val):
+                    yield Completion(
+                        name + "()",
+                        start_position=-len(partial),
+                        display=name + "()",
+                        display_meta="func",
+                    )
+                else:
+                    yield Completion(name, start_position=-len(partial))
 
     @staticmethod
     def _complete_table_methods(partial):
@@ -220,13 +305,13 @@ def cmd_python(args, config, session_manager):
         Panel(
             "[bold]Python REPL Mode[/bold]\n\n"
             "[bold]Clients[/bold] (type name to see helpers):\n"
-            "  [cyan]ec2[/cyan], [cyan]s3[/cyan], [cyan]iam[/cyan], [cyan]lam[/cyan], "
-            "[cyan]cfn[/cyan], [cyan]sts[/cyan], [cyan]rds[/cyan], [cyan]sqs[/cyan], "
-            "[cyan]ses[/cyan], [cyan]opensearch[/cyan],\n"
+            "  [cyan]ec2[/cyan], [cyan]vpc[/cyan], [cyan]asg[/cyan], [cyan]s3[/cyan], "
+            "[cyan]iam[/cyan], [cyan]lam[/cyan], [cyan]cfn[/cyan], [cyan]sts[/cyan], "
+            "[cyan]rds[/cyan], [cyan]sqs[/cyan], [cyan]ses[/cyan], [cyan]opensearch[/cyan],\n"
             "  [cyan]route53[/cyan], [cyan]ga_client[/cyan], [cyan]cloudfront[/cyan], "
             "[cyan]cw[/cyan], [cyan]logs[/cyan], [cyan]secrets[/cyan], [cyan]dynamodb[/cyan],\n"
             "  [cyan]ssm_client[/cyan], [cyan]ecs_client[/cyan], [cyan]sso_admin[/cyan], "
-            "[cyan]elasticache[/cyan], [cyan]cognito[/cyan]\n\n"
+            "[cyan]cache[/cyan], [cyan]cognito[/cyan]\n\n"
             "[bold]Examples:[/bold]\n"
             "  [cyan]ec2.list_instances()[/cyan]                    "
             "[dim]# Rich table output[/dim]\n"
@@ -243,6 +328,9 @@ def cmd_python(args, config, session_manager):
             "  [cyan]ec2.describe_instances(InstanceIds=[...])[/cyan]  "
             "[dim]# Direct boto3 call[/dim]\n\n"
             "[bold]Utilities:[/bold]\n"
+            "  [cyan]docs()[/cyan]            - Overview of all clients & helpers\n"
+            "  [cyan]docs(ec2)[/cyan]         - Show helpers for a client\n"
+            "  [cyan]docs(find)[/cyan]        - Show docs for any function\n"
             "  [cyan]find(data, kw)[/cyan]    - Fuzzy search through any data\n"
             "  [cyan]client(name)[/cyan]      - Get any boto3 client\n"
             "  [cyan]resource(name)[/cyan]    - Get any boto3 resource\n"
@@ -258,6 +346,8 @@ def cmd_python(args, config, session_manager):
     compiler = codeop.CommandCompiler()
 
     # Key bindings: Enter auto-submits if code is complete, otherwise adds a newline
+    # Inside indented blocks, Enter always adds a newline; submit with a blank line.
+    # Ctrl+R: reverse history search
     bindings = KeyBindings()
 
     @bindings.add(Keys.Enter)
@@ -267,6 +357,12 @@ def cmd_python(args, config, session_manager):
 
         if not text.strip():
             buf.validate_and_handle()
+            return
+
+        # If the last line is indented, we're inside a block — always add newline
+        last_line = text.split("\n")[-1]
+        if last_line and last_line[0] in (" ", "\t"):
+            buf.insert_text("\n")
             return
 
         try:
@@ -279,6 +375,11 @@ def cmd_python(args, config, session_manager):
             buf.insert_text("\n")
         else:
             buf.validate_and_handle()
+
+    @bindings.add(Keys.ControlR)
+    def _reverse_search(event):
+        from prompt_toolkit.search import start_search, SearchDirection
+        start_search(direction=SearchDirection.BACKWARD)
 
     py_session = PromptSession(
         history=FileHistory(history_path),
@@ -301,6 +402,7 @@ def cmd_python(args, config, session_manager):
             if stripped in ("exit", "exit()", "quit", "quit()"):
                 console.print("[dim]Returning to AWS Shell...[/dim]")
                 break
+            text = _rewrite_shell_style(text)
             _exec_python(text, namespace)
         except KeyboardInterrupt:
             console.print("\nKeyboardInterrupt")
@@ -308,6 +410,28 @@ def cmd_python(args, config, session_manager):
         except EOFError:
             console.print("[dim]\nReturning to AWS Shell...[/dim]")
             break
+
+
+def _rewrite_shell_style(text):
+    """Rewrite shell-style commands to valid Python calls.
+
+    Converts e.g. ``ai how do I list EC2s`` to ``ai("how do I list EC2s")``.
+    Only triggers when the line starts with a known function name followed by
+    bare words (no parentheses).
+    """
+    import re
+    stripped = text.strip()
+    # Match: ai <anything that doesn't start with ( >
+    m = re.match(r'^ai\s+(?!\()(.*)', stripped)
+    if m:
+        arg = m.group(1)
+        # Strip surrounding quotes if the user already wrapped them
+        if (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
+            return f'ai({arg})'
+        # Escape any embedded quotes
+        escaped = arg.replace('\\', '\\\\').replace('"', '\\"')
+        return f'ai("{escaped}")'
+    return text
 
 
 def _exec_python(code_str, namespace):
@@ -408,17 +532,140 @@ def _build_namespace(config, session_manager):
             console.print(text)
         console.print(f"\n[dim]{len(results)} match(es)[/dim]")
 
+    def docs(obj=None):
+        """Show documentation for a client, function, or method."""
+        from rich.panel import Panel
+        from rich.table import Table as RichTable
+
+        if obj is None:
+            # General overview
+            clients = []
+            for key, val in sorted(namespace.items()):
+                if isinstance(val, ServiceHelper):
+                    helpers = sorted(
+                        k for k in val.__dict__
+                        if not k.startswith('_') and callable(val.__dict__[k])
+                    )
+                    helpers_str = ", ".join(f"[cyan].{h}()[/cyan]" for h in helpers) if helpers else "[dim]no helpers[/dim]"
+                    clients.append((f"[bold]{key}[/bold]", helpers_str))
+
+            table = RichTable(title="Available Clients & Helpers", show_lines=True)
+            table.add_column("Client", style="green", min_width=12)
+            table.add_column("Helper Methods")
+            for name, helpers in clients:
+                table.add_row(name, helpers)
+            console.print(table)
+
+            console.print(Panel(
+                "[bold]Utilities:[/bold]\n"
+                "  [cyan]find(data, kw)[/cyan]    Fuzzy search through any data\n"
+                "  [cyan]docs()[/cyan]            Show this overview\n"
+                "  [cyan]docs(ec2)[/cyan]         Show helpers for a client\n"
+                "  [cyan]docs(find)[/cyan]        Show docs for a function\n"
+                "  [cyan]client(name)[/cyan]      Get any boto3 client\n"
+                "  [cyan]resource(name)[/cyan]    Get any boto3 resource\n"
+                "  [cyan]set_region(name)[/cyan]  Switch region\n"
+                "  [cyan]set_profile(name)[/cyan] Switch profile\n\n"
+                "[bold]Table Methods[/bold] (call [cyan].help()[/cyan] on any table):\n"
+                "  [cyan].filter()[/cyan] [cyan].find()[/cyan] [cyan].sort()[/cyan] "
+                "[cyan].select()[/cyan] [cyan].data[/cyan] [cyan].json()[/cyan] [cyan].help()[/cyan]",
+                title="Quick Reference",
+                border_style="green",
+            ))
+            return
+
+        if isinstance(obj, ServiceHelper):
+            # Show client helpers
+            helpers = sorted(
+                k for k in obj.__dict__
+                if not k.startswith('_') and callable(obj.__dict__[k])
+            )
+            lines = [f"[bold]{obj._name}[/bold] client\n"]
+            if helpers:
+                lines.append("[bold]Helper methods:[/bold]")
+                for h in helpers:
+                    func = obj.__dict__[h]
+                    doc = (func.__doc__ or "").strip().split("\n")[0]
+                    lines.append(f"  [cyan]{obj._name}.{h}()[/cyan]  {doc}")
+            lines.append(f"\n[bold]Direct boto3 methods:[/bold]")
+            lines.append(f"  [dim]All {obj._name}.* boto3 methods work too, e.g.:[/dim]")
+            client_methods = [a for a in dir(obj._client) if not a.startswith('_') and callable(getattr(obj._client, a, None))]
+            sample = client_methods[:8]
+            lines.append(f"  [dim]{', '.join(sample)}{'...' if len(client_methods) > 8 else ''}[/dim]")
+            console.print(Panel("\n".join(lines), title=f"docs({obj._name})", border_style="cyan"))
+            return
+
+        if isinstance(obj, ResourceTable):
+            obj.help()
+            return
+
+        if callable(obj):
+            import inspect
+            name = getattr(obj, '__name__', str(obj))
+            doc = inspect.getdoc(obj) or "No documentation available."
+            try:
+                sig = str(inspect.signature(obj))
+            except (ValueError, TypeError):
+                sig = "(...)"
+            console.print(Panel(
+                f"[bold cyan]{name}[/bold cyan][dim]{sig}[/dim]\n\n{doc}",
+                title=f"docs({name})",
+                border_style="cyan",
+            ))
+            return
+
+        console.print(f"[yellow]No docs for {type(obj).__name__}: {obj!r}[/yellow]")
+
+    import builtins as _builtins
+    _original_print = _builtins.print
+
+    def smart_print(*args, **kwargs):
+        """Print with auto-prettified JSON for dicts and lists."""
+        from ..utils.output import print_json
+        if len(args) == 1 and not kwargs.get("file") and isinstance(args[0], (dict, list)):
+            try:
+                print_json(args[0])
+            except (TypeError, ValueError):
+                _original_print(*args, **kwargs)
+        else:
+            _original_print(*args, **kwargs)
+
+    def raw(*args):
+        """Print raw unformatted repr of any object."""
+        for arg in args:
+            _original_print(repr(arg))
+
+    def ai(question):
+        """Ask the AI assistant a question about AWS.
+
+        Examples:
+            ai("how do I list running EC2 instances?")
+            ai("what permissions does my role have?")
+            ai("clear")  — clear conversation history
+        """
+        from .ai_cmd import cmd_ai
+        if isinstance(question, str):
+            args = question.split() if question.strip() else []
+        else:
+            args = [str(question)]
+        # In REPL mode, no registry — suggested commands are printed but not auto-executed
+        cmd_ai(args, config, session_manager, registry=None)
+
     namespace.update({
         "__builtins__": __builtins__,
         "boto3": boto3,
         "session": session_manager._session,
         "config": config,
         # Utility functions
+        "print": smart_print,
+        "raw": raw,
         "find": find,
+        "docs": docs,
         "client": get_client,
         "resource": get_resource,
         "set_region": set_region,
         "set_profile": set_profile,
+        "ai": ai,
     })
 
     _attach_service_helpers(namespace, session_manager)
@@ -453,6 +700,47 @@ def _simple_helper(sm, service, method, key_path, columns=None, title=None, **ca
             data = [data] if data else []
         return ResourceTable(data, columns=columns, title=title)
     return helper
+
+
+def _format_sg_rules(rules):
+    """Format security group rules into a readable multi-line string."""
+    lines = []
+    for rule in rules:
+        proto = rule.get("IpProtocol", "")
+        if proto == "-1":
+            port_str = "All traffic"
+        elif rule.get("FromPort") == rule.get("ToPort"):
+            port_str = f"{rule['FromPort']}/{proto}"
+        else:
+            port_str = f"{rule.get('FromPort')}-{rule.get('ToPort')}/{proto}"
+
+        # Collect all sources/destinations
+        sources = []
+        for cidr in rule.get("IpRanges", []):
+            desc = cidr.get("Description", "")
+            label = f"{cidr['CidrIp']}"
+            if desc:
+                label += f" ({desc})"
+            sources.append(label)
+        for cidr in rule.get("Ipv6Ranges", []):
+            desc = cidr.get("Description", "")
+            label = f"{cidr['CidrIpv6']}"
+            if desc:
+                label += f" ({desc})"
+            sources.append(label)
+        for sg_ref in rule.get("UserIdGroupPairs", []):
+            desc = sg_ref.get("Description", "")
+            label = f"{sg_ref['GroupId']}"
+            if desc:
+                label += f" ({desc})"
+            sources.append(label)
+        for pl in rule.get("PrefixListIds", []):
+            sources.append(pl.get("PrefixListId", ""))
+
+        for src in sources:
+            lines.append(f"{src} \u2192 {port_str}")
+
+    return "\n".join(lines) if lines else "None"
 
 
 # ---------------------------------------------------------------------------
@@ -504,18 +792,210 @@ def _attach_service_helpers(namespace, session_manager):
     def _ec2_list_security_groups(vpc_id=None):
         c = sm.client("ec2")
         kwargs = {"Filters": [{"Name": "vpc-id", "Values": [vpc_id]}]} if vpc_id else {}
+        sgs = c.describe_security_groups(**kwargs)["SecurityGroups"]
+        for sg in sgs:
+            sg["_Inbound"] = _format_sg_rules(sg.get("IpPermissions", []))
+            sg["_Outbound"] = _format_sg_rules(sg.get("IpPermissionsEgress", []))
         return ResourceTable(
-            c.describe_security_groups(**kwargs)["SecurityGroups"],
+            sgs,
             columns=[("GroupId", "Group ID", "cyan"), ("GroupName", "Name", "green"),
-                     ("VpcId", "VPC ID", "cyan"), ("Description", "Description")],
+                     ("Tags.Name", "Tag Name", "green"),
+                     ("VpcId", "VPC ID", "cyan"),
+                     ("_Inbound", "Inbound", "white"),
+                     ("_Outbound", "Outbound", "white"),
+                     ("Description", "Description")],
             title="Security Groups",
         )
+
+    def _ec2_get_metrics(instance_id, hours=1):
+        """Get CloudWatch metrics for an EC2 instance.
+
+        Args:
+            instance_id: EC2 instance ID (e.g. 'i-0abc123')
+            hours: How many hours back to look (default: 1)
+
+        Returns ResourceTable with CPU, Network, Disk, and Status metrics.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cw_client = sm.client("cloudwatch")
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=hours)
+        period = max(300, (hours * 3600) // 12)  # ~12 data points
+
+        metrics = [
+            ("CPUUtilization", "Percent", "Average"),
+            ("NetworkIn", "Bytes", "Sum"),
+            ("NetworkOut", "Bytes", "Sum"),
+            ("DiskReadOps", "Count", "Sum"),
+            ("DiskWriteOps", "Count", "Sum"),
+            ("StatusCheckFailed", "Count", "Maximum"),
+            ("StatusCheckFailed_Instance", "Count", "Maximum"),
+            ("StatusCheckFailed_System", "Count", "Maximum"),
+        ]
+
+        rows = []
+        for metric_name, unit, stat in metrics:
+            resp = cw_client.get_metric_statistics(
+                Namespace="AWS/EC2",
+                MetricName=metric_name,
+                Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+                StartTime=start,
+                EndTime=end,
+                Period=period,
+                Statistics=[stat],
+                Unit=unit,
+            )
+            datapoints = sorted(resp.get("Datapoints", []), key=lambda d: d["Timestamp"])
+            if datapoints:
+                latest = datapoints[-1]
+                val = latest[stat]
+                # Format bytes as human-readable
+                if unit == "Bytes" and val > 0:
+                    for u in ["B", "KB", "MB", "GB"]:
+                        if val < 1024:
+                            formatted = f"{val:.1f} {u}"
+                            break
+                        val /= 1024
+                    else:
+                        formatted = f"{val:.1f} TB"
+                elif unit == "Percent":
+                    formatted = f"{val:.1f}%"
+                else:
+                    formatted = f"{val:.0f}"
+                rows.append({
+                    "Metric": metric_name,
+                    "Latest": formatted,
+                    "Stat": stat,
+                    "Datapoints": len(datapoints),
+                    "Timestamp": latest["Timestamp"].strftime("%H:%M:%S"),
+                })
+            else:
+                rows.append({
+                    "Metric": metric_name,
+                    "Latest": "-",
+                    "Stat": stat,
+                    "Datapoints": 0,
+                    "Timestamp": "-",
+                })
+
+        return ResourceTable(rows, columns=[
+            ("Metric", "Metric", "cyan"),
+            ("Latest", "Latest Value", "bold"),
+            ("Stat", "Statistic", "yellow"),
+            ("Datapoints", "Points", "dim"),
+            ("Timestamp", "Last Updated", "dim"),
+        ], title=f"EC2 Metrics: {instance_id} (last {hours}h)")
+
+    def _ec2_get_cpu(instance_id, hours=3):
+        """Get CPU utilization history for an EC2 instance.
+
+        Returns a time series of CPU usage at 5-minute intervals.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cw_client = sm.client("cloudwatch")
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=hours)
+
+        resp = cw_client.get_metric_statistics(
+            Namespace="AWS/EC2",
+            MetricName="CPUUtilization",
+            Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+            StartTime=start,
+            EndTime=end,
+            Period=300,
+            Statistics=["Average", "Maximum"],
+        )
+
+        datapoints = sorted(resp.get("Datapoints", []), key=lambda d: d["Timestamp"])
+        rows = []
+        for dp in datapoints:
+            rows.append({
+                "Time": dp["Timestamp"].strftime("%Y-%m-%d %H:%M"),
+                "Average": f"{dp['Average']:.1f}%",
+                "Maximum": f"{dp['Maximum']:.1f}%",
+            })
+
+        return ResourceTable(rows, columns=[
+            ("Time", "Time", "dim"),
+            ("Average", "Avg CPU %", "cyan"),
+            ("Maximum", "Max CPU %", "bold"),
+        ], title=f"CPU Utilization: {instance_id} (last {hours}h)")
 
     ec2.list_instances = _ec2_list_instances
     ec2.list_vpcs = _ec2_list_vpcs
     ec2.list_subnets = _ec2_list_subnets
     ec2.list_security_groups = _ec2_list_security_groups
+    ec2.get_metrics = _ec2_get_metrics
+    ec2.get_cpu = _ec2_get_cpu
     namespace["ec2"] = ec2
+
+    # --- VPC (wraps ec2 client, VPC-focused helpers) ---
+    vpc = ServiceHelper("vpc", sm.client("ec2"))
+    vpc.list_vpcs = _ec2_list_vpcs
+    vpc.list_subnets = _ec2_list_subnets
+    vpc.list_security_groups = _ec2_list_security_groups
+    namespace["vpc"] = vpc
+
+    # --- ASG (Auto Scaling Groups) ---
+    asg = ServiceHelper("asg", sm.client("autoscaling"))
+
+    def _asg_list_groups():
+        c = sm.client("autoscaling")
+        groups = []
+        for page in c.get_paginator("describe_auto_scaling_groups").paginate():
+            groups.extend(page["AutoScalingGroups"])
+        for g in groups:
+            g["_Instances"] = len(g.get("Instances", []))
+            health = {}
+            for inst in g.get("Instances", []):
+                h = inst.get("HealthStatus", "Unknown")
+                health[h] = health.get(h, 0) + 1
+            g["_Health"] = ", ".join(f"{v} {k}" for k, v in health.items()) if health else "-"
+        return ResourceTable(groups, columns=[
+            ("AutoScalingGroupName", "ASG Name", "green"),
+            ("MinSize", "Min", "yellow"),
+            ("MaxSize", "Max", "yellow"),
+            ("DesiredCapacity", "Desired", "yellow"),
+            ("_Instances", "Instances", "cyan"),
+            ("_Health", "Health", "bold"),
+            ("LaunchTemplate.LaunchTemplateName", "Launch Template"),
+            ("AvailabilityZones", "AZs"),
+        ], title="Auto Scaling Groups")
+
+    def _asg_list_instances():
+        c = sm.client("autoscaling")
+        instances = []
+        for page in c.get_paginator("describe_auto_scaling_instances").paginate():
+            instances.extend(page["AutoScalingInstances"])
+        return ResourceTable(instances, columns=[
+            ("InstanceId", "Instance ID", "cyan"),
+            ("AutoScalingGroupName", "ASG Name", "green"),
+            ("LifecycleState", "State", "bold"),
+            ("HealthStatus", "Health", "bold"),
+            ("InstanceType", "Type", "yellow"),
+            ("AvailabilityZone", "AZ"),
+        ], title="ASG Instances")
+
+    def _asg_list_activities(asg_name=None):
+        c = sm.client("autoscaling")
+        kwargs = {"AutoScalingGroupName": asg_name} if asg_name else {}
+        activities = []
+        for page in c.get_paginator("describe_scaling_activities").paginate(**kwargs):
+            activities.extend(page["Activities"])
+        return ResourceTable(activities[:50], columns=[
+            ("AutoScalingGroupName", "ASG Name", "green"),
+            ("StatusCode", "Status", "bold"),
+            ("Cause", "Cause"),
+            ("StartTime", "Started"),
+            ("EndTime", "Ended"),
+        ], title="Scaling Activities (last 50)")
+
+    asg.list_groups = _asg_list_groups
+    asg.list_instances = _asg_list_instances
+    asg.list_activities = _asg_list_activities
+    namespace["asg"] = asg
 
     # --- S3 ---
     s3 = ServiceHelper("s3", sm.client("s3"))
@@ -699,17 +1179,200 @@ def _attach_service_helpers(namespace, session_manager):
     ecs_client.list_clusters = _ecs_list_clusters
     namespace["ecs_client"] = ecs_client
 
-    # --- SSO Admin (no helpers) ---
-    namespace["sso_admin"] = ServiceHelper("sso", sm.client("sso-admin"))
+    # --- SSO Admin ---
+    sso_admin = ServiceHelper("sso_admin", sm.client("sso-admin"))
 
-    # --- ElastiCache ---
-    elasticache = ServiceHelper("elasticache", sm.client("elasticache"))
-    elasticache.list_clusters = _paginated_helper(
+    def _sso_get_instance_arn():
+        """Get the SSO instance ARN (auto-detected)."""
+        c = sm.client("sso-admin")
+        instances = c.list_instances().get("Instances", [])
+        if not instances:
+            console.print("[red]No SSO instance found[/red]")
+            return None
+        return instances[0]["InstanceArn"]
+
+    def _sso_list_permission_sets():
+        """List all permission sets with names and details."""
+        c = sm.client("sso-admin")
+        instance_arn = _sso_get_instance_arn()
+        if not instance_arn:
+            return ResourceTable([])
+
+        # Get all permission set ARNs
+        arns = []
+        paginator = c.get_paginator("list_permission_sets")
+        for page in paginator.paginate(InstanceArn=instance_arn):
+            arns.extend(page.get("PermissionSets", []))
+
+        # Enrich each with describe_permission_set
+        sets = []
+        for arn in arns:
+            detail = c.describe_permission_set(
+                InstanceArn=instance_arn,
+                PermissionSetArn=arn,
+            ).get("PermissionSet", {})
+            sets.append(detail)
+
+        return ResourceTable(sets, columns=[
+            ("Name", "Name", "green"),
+            ("PermissionSetArn", "Permission Set ARN", "cyan"),
+            ("Description", "Description"),
+            ("SessionDuration", "Session Duration", "yellow"),
+            ("CreatedDate", "Created"),
+        ], title="SSO Permission Sets")
+
+    def _sso_get_policy(name_or_arn=None):
+        """Get the inline policy for a permission set by name or ARN.
+
+        Returns the policy dict. Prints as JSON automatically.
+        To get raw dict without printing, use: sso_admin.get_policy("name").data
+        """
+        import json as _json
+        c = sm.client("sso-admin")
+        instance_arn = _sso_get_instance_arn()
+        if not instance_arn:
+            return
+
+        ps_arn = _sso_resolve_permission_set(c, instance_arn, name_or_arn)
+        if not ps_arn:
+            return
+
+        resp = c.get_inline_policy_for_permission_set(
+            InstanceArn=instance_arn,
+            PermissionSetArn=ps_arn,
+        )
+        policy_str = resp.get("InlinePolicy", "")
+        if not policy_str:
+            console.print("[dim]No inline policy attached[/dim]")
+            return {}
+
+        policy = _json.loads(policy_str)
+        # Wrap statements as a ResourceTable for consistent display
+        statements = policy.get("Statement", [])
+        for stmt in statements:
+            # Flatten Action/Resource lists for display
+            actions = stmt.get("Action", [])
+            stmt["_Actions"] = ", ".join(actions) if isinstance(actions, list) else actions
+            resources = stmt.get("Resource", [])
+            stmt["_Resources"] = ", ".join(resources) if isinstance(resources, list) else resources
+
+        return ResourceTable(statements, columns=[
+            ("Sid", "Sid", "cyan"),
+            ("Effect", "Effect", "bold"),
+            ("_Actions", "Actions", "yellow"),
+            ("_Resources", "Resources"),
+        ], title=f"Inline Policy: {name_or_arn}")
+
+    def _sso_list_managed_policies(name_or_arn=None):
+        """List managed policies attached to a permission set by name or ARN."""
+        c = sm.client("sso-admin")
+        instance_arn = _sso_get_instance_arn()
+        if not instance_arn:
+            return ResourceTable([])
+
+        ps_arn = _sso_resolve_permission_set(c, instance_arn, name_or_arn)
+        if not ps_arn:
+            return ResourceTable([])
+
+        policies = []
+        paginator = c.get_paginator("list_managed_policies_in_permission_set")
+        for page in paginator.paginate(InstanceArn=instance_arn, PermissionSetArn=ps_arn):
+            policies.extend(page.get("AttachedManagedPolicies", []))
+
+        return ResourceTable(policies, columns=[
+            ("Name", "Policy Name", "green"),
+            ("Arn", "Policy ARN", "cyan"),
+        ], title=f"Managed Policies")
+
+    def _sso_list_account_assignments(name_or_arn=None, account_id=None):
+        """List account assignments for a permission set."""
+        c = sm.client("sso-admin")
+        instance_arn = _sso_get_instance_arn()
+        if not instance_arn:
+            return ResourceTable([])
+
+        ps_arn = _sso_resolve_permission_set(c, instance_arn, name_or_arn)
+        if not ps_arn:
+            return ResourceTable([])
+
+        if not account_id:
+            # Try to get from STS
+            account_id = sm.client("sts").get_caller_identity()["Account"]
+
+        assignments = []
+        paginator = c.get_paginator("list_account_assignments")
+        for page in paginator.paginate(
+            InstanceArn=instance_arn,
+            PermissionSetArn=ps_arn,
+            AccountId=account_id,
+        ):
+            assignments.extend(page.get("AccountAssignments", []))
+
+        return ResourceTable(assignments, columns=[
+            ("PrincipalType", "Principal Type", "yellow"),
+            ("PrincipalId", "Principal ID", "cyan"),
+            ("PermissionSetArn", "Permission Set ARN"),
+            ("AccountId", "Account ID"),
+        ], title=f"Account Assignments")
+
+    def _sso_resolve_permission_set(client, instance_arn, name_or_arn):
+        """Resolve a permission set name or ARN to an ARN."""
+        if name_or_arn and name_or_arn.startswith("arn:"):
+            return name_or_arn
+
+        # List all and match by name
+        arns = []
+        paginator = client.get_paginator("list_permission_sets")
+        for page in paginator.paginate(InstanceArn=instance_arn):
+            arns.extend(page.get("PermissionSets", []))
+
+        for arn in arns:
+            detail = client.describe_permission_set(
+                InstanceArn=instance_arn,
+                PermissionSetArn=arn,
+            ).get("PermissionSet", {})
+            if name_or_arn is None:
+                console.print(f"[yellow]Please specify a permission set name or ARN[/yellow]")
+                return None
+            if detail.get("Name", "").lower() == name_or_arn.lower():
+                return arn
+
+        console.print(f"[red]Permission set '{name_or_arn}' not found[/red]")
+        return None
+
+    sso_admin.list_permission_sets = _sso_list_permission_sets
+    sso_admin.get_policy = _sso_get_policy
+    sso_admin.list_managed_policies = _sso_list_managed_policies
+    sso_admin.list_account_assignments = _sso_list_account_assignments
+    namespace["sso_admin"] = sso_admin
+
+    # --- Cache (ElastiCache) ---
+    cache = ServiceHelper("cache", sm.client("elasticache"))
+    cache.list_clusters = _paginated_helper(
         sm, "elasticache", "describe_cache_clusters", "CacheClusters",
         columns=[("CacheClusterId", "Cluster ID"), ("CacheNodeType", "Node Type"),
                  ("Engine", "Engine"), ("CacheClusterStatus", "Status")],
         title="ElastiCache Clusters")
-    namespace["elasticache"] = elasticache
+    cache.list_replication_groups = _paginated_helper(
+        sm, "elasticache", "describe_replication_groups", "ReplicationGroups",
+        columns=[("ReplicationGroupId", "Replication Group ID"), ("Description", "Description"),
+                 ("Status", "Status"), ("ClusterEnabled", "Cluster Enabled")],
+        title="ElastiCache Replication Groups")
+
+    def _cache_list_serverless():
+        c = sm.client("elasticache")
+        resp = c.describe_serverless_caches()
+        items = resp.get("ServerlessCaches", [])
+        return ResourceTable(items, columns=[
+            ("ServerlessCacheName", "Name"),
+            ("Engine", "Engine"),
+            ("MajorEngineVersion", "Version"),
+            ("Status", "Status"),
+            ("ARN", "ARN"),
+        ], title="ElastiCache Serverless Caches")
+
+    cache.list_serverless = _cache_list_serverless
+    namespace["cache"] = cache
 
     # --- Cognito ---
     cognito = ServiceHelper("cognito", sm.client("cognito-idp"))

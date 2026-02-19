@@ -34,10 +34,11 @@ class CommandRegistry:
         from .ssm import register as register_ssm
         from .ecs import register as register_ecs
         from .sso import register as register_sso
-        from .elasticache import register as register_elasticache
+        from .cache import register as register_cache
         from .cognito import register as register_cognito
         from .vpc import register as register_vpc
         from .search_cmd import register as register_search
+        from .ai_cmd import register as register_ai
 
         register_general(self)
         register_help(self)
@@ -61,10 +62,11 @@ class CommandRegistry:
         register_ssm(self)
         register_ecs(self)
         register_sso(self)
-        register_elasticache(self)
+        register_cache(self)
         register_cognito(self)
         register_vpc(self)
         register_search(self)
+        register_ai(self)
 
     def register(self, name, handler, help_text=""):
         self._commands[name] = {

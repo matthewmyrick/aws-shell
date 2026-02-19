@@ -40,7 +40,7 @@ COMMAND_DESCRIPTIONS = {
     "ssm": "Systems Manager",
     "ecs": "Elastic Container Service",
     "sso": "SSO Admin",
-    "elasticache": "ElastiCache",
+    "cache": "Caching (ElastiCache)",
     "cognito": "Cognito User Pools",
     "search": "Fuzzy search resource configs",
     "help": "Show available commands",
@@ -55,6 +55,9 @@ COMMAND_DESCRIPTIONS = {
     "clear": "Clear terminal",
     "exit": "Exit the shell",
     "quit": "Exit the shell",
+    "ai": "Ask AI about AWS",
+    "set-config": "Set a config value",
+    "show-config": "Show all config values",
 }
 
 # Subcommand descriptions per service
@@ -174,17 +177,22 @@ SUBCOMMAND_DESCRIPTIONS = {
         "list-permission-sets": "List permission sets",
         "get-config": "Get permission set config JSON",
     },
-    "elasticache": {
-        "list-clusters": "List cache clusters",
-        "describe-cluster": "Show cluster details",
+    "cache": {
+        "list": "List all caches (clusters, replication groups, serverless)",
+        "list-clusters": "List traditional cache clusters",
         "list-replication-groups": "List replication groups",
-        "get-config": "Get full cluster config JSON",
+        "list-serverless": "List serverless caches",
+        "describe": "Describe a cache by ID (auto-detects type)",
+        "get-config": "Get full cache config JSON",
     },
     "cognito": {
         "list-user-pools": "List user pools",
         "describe-user-pool": "Show user pool details",
         "list-users": "List users in a pool",
         "get-config": "Get full user pool config JSON",
+    },
+    "ai": {
+        "clear": "Clear conversation history",
     },
     "help": {
         "ec2": "EC2 help",
@@ -207,11 +215,12 @@ SUBCOMMAND_DESCRIPTIONS = {
         "ssm": "Systems Manager help",
         "ecs": "ECS help",
         "sso": "SSO help",
-        "elasticache": "ElastiCache help",
+        "cache": "Cache help",
         "cognito": "Cognito help",
         "search": "Search help",
         "python": "Python REPL help",
         "general": "General commands help",
+        "ai": "AI assistant help",
     },
 }
 

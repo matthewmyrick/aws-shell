@@ -18,7 +18,7 @@ SERVICE_DESCRIBERS = {
     "opensearch": ("opensearch", "describe_domain", "DomainName", "DomainStatus"),
     "secrets": ("secretsmanager", "describe_secret", "SecretId", None),
     "ssm": ("ssm", "get_parameter", "Name", "Parameter"),
-    "elasticache": ("elasticache", "describe_cache_clusters", "CacheClusterId", None),
+    "cache": ("elasticache", "describe_serverless_caches", "ServerlessCacheName", None),
     "cognito": ("cognito-idp", "describe_user_pool", "UserPoolId", "UserPool"),
     "route53": ("route53", "get_hosted_zone", "Id", None),
     "sqs": ("sqs", "get_queue_attributes", "QueueUrl", "Attributes"),
@@ -64,8 +64,12 @@ def cmd_search(args, config, session_manager):
             response = method(QueueUrl=resource_id, AttributeNames=["All"])
         elif service == "rds":
             response = method(DBInstanceIdentifier=resource_id)
-        elif service == "elasticache":
-            response = method(CacheClusterId=resource_id, ShowCacheNodeInfo=True)
+        elif service == "cache":
+            # Try serverless first, fall back to traditional cluster
+            try:
+                response = client.describe_serverless_caches(ServerlessCacheName=resource_id)
+            except Exception:
+                response = client.describe_cache_clusters(CacheClusterId=resource_id, ShowCacheNodeInfo=True)
         else:
             response = method(**{param_name: resource_id})
 

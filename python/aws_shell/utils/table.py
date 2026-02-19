@@ -166,6 +166,73 @@ def _guess_column_style(header_lower):
     return "white"
 
 
+_METHOD_DOCS = {
+    "filter": (
+        '.filter(key="value") or .filter(lambda i: ...)',
+        "Filter rows with exact match (case-insensitive). Use * for wildcards.\n\n"
+        "Examples:\n"
+        '  .filter(Name="swe-permission-set")   # exact match\n'
+        '  .filter(Name="*swe*")                # contains "swe"\n'
+        '  .filter(Name="*swe")                 # ends with "swe"\n'
+        '  .filter(InstanceType="t3*")          # starts with "t3"\n'
+        '  .filter(State="running")             # exact match\n'
+        "  .filter(lambda i: i['InstanceType'].startswith('t3'))"
+    ),
+    "find": (
+        '.find("keyword")',
+        "Fuzzy search across ALL fields. Returns rows where any value matches.\n\n"
+        "Examples:\n"
+        '  .find("production")    # search all fields\n'
+        '  .find("10.0.1")       # find by IP fragment\n'
+        '  .find("docker")       # find by keyword'
+    ),
+    "sort": (
+        '.sort("key", reverse=False)',
+        "Sort rows by a column key. Supports nested keys and Tags.\n\n"
+        "Examples:\n"
+        '  .sort("Tags.Name")                    # sort by name tag\n'
+        '  .sort("LaunchTime", reverse=True)     # newest first'
+    ),
+    "select": (
+        '.select("key:Header", ...)',
+        "Choose which columns to display. Use 'key' or 'key:Header' format.\n\n"
+        "Examples:\n"
+        '  .select("InstanceId:ID", "Tags.Name:Name", "State.Name:State")'
+    ),
+    "json": (
+        ".json()",
+        "Pretty-print all data as formatted, syntax-highlighted JSON."
+    ),
+    "help": (
+        ".help()",
+        "Show overview of all available ResourceTable methods."
+    ),
+}
+
+
+class _DocMethod:
+    """Wraps a ResourceTable method so it's callable AND has .docs."""
+
+    def __init__(self, method, name):
+        self._method = method
+        self._name = name
+
+    def __call__(self, *args, **kwargs):
+        return self._method(*args, **kwargs)
+
+    @property
+    def docs(self):
+        info = _METHOD_DOCS.get(self._name)
+        if info:
+            sig, doc = info
+            console.print(f"\n[bold cyan]{sig}[/bold cyan]\n\n{doc}\n")
+        else:
+            console.print(f"[dim]No docs for .{self._name}[/dim]")
+
+    def __repr__(self):
+        return f"<.{self._name}() method — call .docs for help>"
+
+
 class ResourceTable:
     """A list of resource dicts that renders as a Rich table.
 
@@ -184,7 +251,17 @@ class ResourceTable:
         .data                                 - Raw list of dicts
         .json()                               - Print as JSON
         [0], [1:5], len()                     - Indexing & slicing
+
+    Tip: access any method without () to see .docs, e.g. .filter.docs
     """
+
+    _DOC_METHODS = frozenset({"filter", "find", "sort", "select", "json", "help"})
+
+    def __getattribute__(self, name):
+        attr = object.__getattribute__(self, name)
+        if name in ResourceTable._DOC_METHODS and callable(attr):
+            return _DocMethod(attr, name)
+        return attr
 
     def __init__(self, data, columns=None, title=None):
         self._data = data if isinstance(data, list) else list(data)
@@ -229,13 +306,17 @@ class ResourceTable:
     def filter(self, fn=None, **kwargs):
         """Filter rows by function or keyword arguments.
 
-        Uses contains matching (case-insensitive) by default.
+        Exact match (case-insensitive) by default.
+        Use * for wildcard/contains matching.
         Supports nested keys (State.Name) and auto-checks Tags.
 
         Examples:
-            .filter(Name="GPU")           # contains match on Name tag
-            .filter(State="running")      # matches nested State.Name
-            .filter(InstanceType="t3")    # matches t3.small, t3.medium, etc.
+            .filter(Name="swe-permission-set")   # exact match
+            .filter(Name="*swe*")                 # contains "swe"
+            .filter(Name="*swe")                  # ends with "swe"
+            .filter(Name="swe*")                  # starts with "swe"
+            .filter(State="running")              # exact match
+            .filter(InstanceType="t3*")           # starts with "t3"
             .filter(lambda i: i['InstanceType'].startswith('t3'))
         """
         if fn is not None:
@@ -244,7 +325,15 @@ class ResourceTable:
             filtered = self._data
             for key, value in kwargs.items():
                 result = []
-                value_lower = str(value).lower()
+                value_str = str(value)
+                value_lower = value_str.lower()
+
+                # Determine match mode from wildcards
+                has_prefix_star = value_str.startswith("*")
+                has_suffix_star = value_str.endswith("*")
+                # Strip wildcards for the actual comparison value
+                match_val = value_lower.lstrip("*").rstrip("*")
+
                 for item in filtered:
                     if not isinstance(item, dict):
                         continue
@@ -254,15 +343,30 @@ class ResourceTable:
                         item_val = _get_value(item, f"Tags.{key}")
                     if item_val is None:
                         continue
-                    # Contains matching (case-insensitive)
-                    if isinstance(item_val, dict):
-                        if any(value_lower in str(v).lower() for v in item_val.values()):
+
+                    if isinstance(item_val, (dict, list)):
+                        # For complex types, always use contains matching
+                        vals = item_val.values() if isinstance(item_val, dict) else item_val
+                        if any(match_val in str(v).lower() for v in vals):
                             result.append(item)
-                    elif isinstance(item_val, list):
-                        if any(value_lower in str(v).lower() for v in item_val):
-                            result.append(item)
-                    elif value_lower in str(item_val).lower():
-                        result.append(item)
+                    else:
+                        item_str = str(item_val).lower()
+                        if has_prefix_star and has_suffix_star:
+                            # *value* → contains
+                            if match_val in item_str:
+                                result.append(item)
+                        elif has_prefix_star:
+                            # *value → ends with
+                            if item_str.endswith(match_val):
+                                result.append(item)
+                        elif has_suffix_star:
+                            # value* → starts with
+                            if item_str.startswith(match_val):
+                                result.append(item)
+                        else:
+                            # exact match (case-insensitive)
+                            if item_str == match_val:
+                                result.append(item)
                 filtered = result
         return ResourceTable(filtered, columns=self._columns, title=self._title)
 
@@ -328,6 +432,45 @@ class ResourceTable:
         json_str = json.dumps(self._data, indent=2, cls=_DateTimeEncoder, default=str)
         syntax = Syntax(json_str, "json", theme="monokai", line_numbers=False)
         console.print(syntax)
+
+    def help(self):
+        """Show available ResourceTable methods with examples."""
+        from rich.panel import Panel
+
+        console.print(Panel(
+            "[bold cyan].filter[/bold cyan](key=\"value\")  or  .filter(lambda i: ...)\n"
+            "  Contains match (case-insensitive). Auto-checks Tags.\n"
+            "  [dim]ec2.list_instances().filter(State=\"running\")\n"
+            "  ec2.list_instances().filter(Name=\"web\")\n"
+            "  ec2.list_instances().filter(InstanceType=\"t3\")\n"
+            "  ec2.list_instances().filter(lambda i: i[\"InstanceType\"].startswith(\"t3\"))[/dim]\n\n"
+            "[bold cyan].find[/bold cyan](\"keyword\")\n"
+            "  Fuzzy search across all fields. Returns matching rows.\n"
+            "  [dim]ec2.list_instances().find(\"production\")[/dim]\n\n"
+            "[bold cyan].sort[/bold cyan](\"key\", reverse=False)\n"
+            "  Sort rows by column. Supports nested keys and Tags.\n"
+            "  [dim]ec2.list_instances().sort(\"Tags.Name\")\n"
+            "  ec2.list_instances().sort(\"LaunchTime\", reverse=True)[/dim]\n\n"
+            "[bold cyan].select[/bold cyan](\"key:Header\", ...)\n"
+            "  Choose which columns to display.\n"
+            "  [dim]ec2.list_instances().select(\"InstanceId:ID\", \"Tags.Name:Name\", \"State.Name:State\")[/dim]\n\n"
+            "[bold cyan].data[/bold cyan]\n"
+            "  Raw list of dicts (JSON output).\n"
+            "  [dim]ec2.list_instances().data[/dim]\n\n"
+            "[bold cyan].json[/bold cyan]()\n"
+            "  Pretty-print as formatted JSON.\n"
+            "  [dim]ec2.list_instances().json()[/dim]\n\n"
+            "[bold cyan].help[/bold cyan]()\n"
+            "  Show this help.\n\n"
+            "[bold]Chaining:[/bold] all methods return a new table so you can chain them:\n"
+            "  [dim]ec2.list_instances().filter(State=\"running\").find(\"web\").sort(\"Tags.Name\")[/dim]\n\n"
+            "[bold]Slicing:[/bold]\n"
+            "  [dim]ec2.list_instances()[:10]     # first 10 rows\n"
+            "  ec2.list_instances()[0]       # first row as dict\n"
+            "  len(ec2.list_instances())     # row count[/dim]",
+            title="ResourceTable Methods",
+            border_style="cyan",
+        ))
 
     def __len__(self):
         return len(self._data)

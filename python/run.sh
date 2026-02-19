@@ -14,4 +14,4 @@ source venv/bin/activate
 pip install -q -r requirements.txt
 
 # Run the shell
-python __main__.py
+python __main__.py "$@"
