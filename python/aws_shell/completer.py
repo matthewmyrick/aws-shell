@@ -47,6 +47,7 @@ COMMAND_DESCRIPTIONS = {
     "py": "Python REPL",
     "python": "Python REPL",
     "exec": "Run Python expression",
+    "login": "SSO login for current profile",
     "whoami": "Show current identity",
     "services": "List AWS services",
     "use-profile": "Switch AWS profile",
@@ -193,6 +194,7 @@ SUBCOMMAND_DESCRIPTIONS = {
     },
     "ai": {
         "clear": "Clear conversation history",
+        "debug": "Debug last error with AI",
     },
     "help": {
         "ec2": "EC2 help",

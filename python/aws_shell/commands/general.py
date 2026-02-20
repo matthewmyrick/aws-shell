@@ -1,5 +1,6 @@
 """General shell commands."""
 import os
+import subprocess
 
 from rich.console import Console
 from rich.table import Table
@@ -15,6 +16,7 @@ def register(registry):
     registry.register("services", cmd_services, "List available AWS services")
     registry.register("set-config", cmd_set_config, "Set a config value")
     registry.register("show-config", cmd_show_config, "Show all config values")
+    registry.register("login", cmd_login, "Run aws sso login for current profile")
     registry.register("clear", cmd_clear, "Clear the terminal")
     registry.register("exit", cmd_exit, "Exit the shell")
     registry.register("quit", cmd_exit, "Exit the shell")
@@ -33,6 +35,25 @@ def cmd_use_profile(args, config, session_manager):
         console.print(f"  Authenticated as: [bold]{identity['Arn']}[/bold]")
     except Exception as e:
         console.print(f"  [bold red]Warning:[/bold red] Could not validate credentials: {e}")
+
+
+def cmd_login(args, config, session_manager):
+    """Run `aws sso login` for the current or specified profile."""
+    profile = args[0] if args else config.profile
+    console.print(f"[cyan]Running:[/cyan] aws sso login --profile {profile}")
+    try:
+        subprocess.run(["aws", "sso", "login", "--profile", profile], check=False)
+        # Verify credentials work after login
+        try:
+            identity = session_manager.get_caller_identity()
+            console.print(f"[green]Logged in as:[/green] {identity['Arn']}")
+        except Exception:
+            console.print("[yellow]Login may still be in progress or credentials are not yet valid.[/yellow]")
+    except FileNotFoundError:
+        console.print(
+            "[bold red]Error:[/bold red] `aws` CLI not found.\n"
+            "Install it from: [cyan]https://aws.amazon.com/cli/[/cyan]"
+        )
 
 
 def cmd_set_region(args, config, session_manager):

@@ -154,6 +154,7 @@ The shell maintains a current **profile**, **region**, and **output format** (ta
 - `use-profile <name>` — Switch AWS profile
 - `set-region <region>` — Switch AWS region
 - `set-output <table|json|text>` — Set output format
+- `login [profile]` — Run `aws sso login` for the current profile (or a specific one)
 - `services` — List all available AWS services
 - `set-config <key> <value>` — Set a config value (e.g. `set-config llm.model claude-sonnet-4-20250514`)
 - `show-config` — Show all config values
@@ -194,7 +195,7 @@ Each client wraps a boto3 client and exposes helper methods that return rich tab
 | `asg` | Auto Scaling | `list_groups()`, `list_instances()`, `list_activities()` |
 | `s3` | S3 | `list_buckets()`, `list_bucket_names()` |
 | `iam` | IAM | `list_users()`, `list_roles()`, `list_policies()` |
-| `lam` | Lambda | `list_functions()` |
+| `lam` / `aws_lambda` | Lambda | `list_functions()` |
 | `cfn` | CloudFormation | `list_stacks()` |
 | `sts` | STS | (direct boto3 methods) |
 | `rds` | RDS | `list_instances()`, `list_clusters()` |

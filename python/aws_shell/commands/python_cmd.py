@@ -34,13 +34,13 @@ PYTHON_STYLE = Style.from_dict({
 _NAMESPACE_NAMES = {
     "session", "boto3", "config",
     # Service clients (with helpers)
-    "ec2", "vpc", "asg", "s3", "iam", "lam", "cfn", "sts", "rds", "sqs", "ses",
+    "ec2", "vpc", "asg", "s3", "iam", "lam", "aws_lambda", "cfn", "sts", "rds", "sqs", "ses",
     "opensearch", "route53", "ga_client", "cloudfront", "cw", "logs",
     "secrets", "dynamodb", "ssm_client", "ecs_client", "sso_admin",
     "cache", "cognito",
     # Utility functions
     "find", "docs", "raw", "client", "resource", "set_region", "set_profile",
-    "ai",
+    "login", "ai",
 }
 
 
@@ -306,7 +306,7 @@ def cmd_python(args, config, session_manager):
             "[bold]Python REPL Mode[/bold]\n\n"
             "[bold]Clients[/bold] (type name to see helpers):\n"
             "  [cyan]ec2[/cyan], [cyan]vpc[/cyan], [cyan]asg[/cyan], [cyan]s3[/cyan], "
-            "[cyan]iam[/cyan], [cyan]lam[/cyan], [cyan]cfn[/cyan], [cyan]sts[/cyan], "
+            "[cyan]iam[/cyan], [cyan]lam[/cyan] / [cyan]aws_lambda[/cyan], [cyan]cfn[/cyan], [cyan]sts[/cyan], "
             "[cyan]rds[/cyan], [cyan]sqs[/cyan], [cyan]ses[/cyan], [cyan]opensearch[/cyan],\n"
             "  [cyan]route53[/cyan], [cyan]ga_client[/cyan], [cyan]cloudfront[/cyan], "
             "[cyan]cw[/cyan], [cyan]logs[/cyan], [cyan]secrets[/cyan], [cyan]dynamodb[/cyan],\n"
@@ -359,6 +359,11 @@ def cmd_python(args, config, session_manager):
             buf.validate_and_handle()
             return
 
+        # If cursor is NOT at the end, the user is editing mid-block — just insert newline
+        if buf.cursor_position < len(text):
+            buf.insert_text("\n")
+            return
+
         # If the last line is indented, we're inside a block — always add newline
         last_line = text.split("\n")[-1]
         if last_line and last_line[0] in (" ", "\t"):
@@ -375,6 +380,19 @@ def cmd_python(args, config, session_manager):
             buf.insert_text("\n")
         else:
             buf.validate_and_handle()
+
+    @bindings.add(Keys.BracketedPaste)
+    def _handle_paste(event):
+        """Handle bracketed paste: clean up and insert the pasted text."""
+        cleaned = _clean_pasted_code(event.data)
+        event.current_buffer.insert_text(cleaned)
+
+    @bindings.add(Keys.Escape, eager=True)
+    def _handle_escape(event):
+        """Dismiss the completion menu on Escape."""
+        buf = event.current_buffer
+        if buf.complete_state:
+            buf.cancel_completion()
 
     @bindings.add(Keys.ControlR)
     def _reverse_search(event):
@@ -393,17 +411,38 @@ def cmd_python(args, config, session_manager):
         prompt_continuation="... ",
     )
 
+    # Track last execution for ai debug
+    last_exec = {"code": None, "error": None}
+
     while True:
         try:
             text = py_session.prompt(">>> ")
             stripped = text.strip()
             if not stripped:
                 continue
-            if stripped in ("exit", "exit()", "quit", "quit()"):
+            if stripped in ("exit", "exit()"):
                 console.print("[dim]Returning to AWS Shell...[/dim]")
                 break
+            if stripped in ("quit", "quit()"):
+                console.print("[dim]Goodbye![/dim]")
+                raise SystemExit(0)
+
+            # Handle "ai debug" — send last error to AI for diagnosis
+            if stripped in ("ai debug", 'ai("debug")', "ai('debug')"):
+                if not last_exec["error"]:
+                    console.print("[yellow]No recent error to debug.[/yellow]")
+                    continue
+                prompt = (
+                    f"I ran this code in the aws-shell Python REPL and got an error. "
+                    f"Please debug it and give me the corrected code.\n\n"
+                    f"Code:\n```python\n{last_exec['code']}\n```\n\n"
+                    f"Error:\n```\n{last_exec['error']}\n```"
+                )
+                namespace["ai"](prompt)
+                continue
+
             text = _rewrite_shell_style(text)
-            _exec_python(text, namespace)
+            _exec_python(text, namespace, last_exec)
         except KeyboardInterrupt:
             console.print("\nKeyboardInterrupt")
             continue
@@ -434,9 +473,77 @@ def _rewrite_shell_style(text):
     return text
 
 
-def _exec_python(code_str, namespace):
-    """Execute Python code - try eval first (for expressions), fall back to exec."""
+def _clean_pasted_code(code_str):
+    """Clean up code that was pasted from terminal / AI output.
+
+    Handles common copy-paste issues:
+    - Trailing whitespace padding from terminal-width rendering
+    - Leading spaces from rich markdown code block padding
+    - Inconsistent indent when the first line is copied without
+      its leading space but subsequent lines keep it
+    """
+    import textwrap
+
+    lines = [line.rstrip() for line in code_str.splitlines()]
+
+    # Remove leading and trailing blank lines
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+
+    # Standard dedent first
+    code = textwrap.dedent("\n".join(lines))
+
+    # Check if it compiles — if so, we're done
+    try:
+        compile(code, "<input>", "exec")
+        return code
+    except SyntaxError:
+        pass
+
+    # Fallback: the first line may have been copied without its leading space.
+    # Find the minimum indent of non-blank lines AFTER the first line,
+    # and strip that from all non-blank lines.
+    non_blank = [l for l in lines[1:] if l.strip()]
+    if non_blank:
+        min_indent = min(len(l) - len(l.lstrip()) for l in non_blank)
+        if min_indent > 0:
+            fixed = []
+            for line in lines:
+                if not line.strip():
+                    fixed.append("")
+                elif len(line) - len(line.lstrip()) >= min_indent:
+                    fixed.append(line[min_indent:])
+                else:
+                    fixed.append(line.lstrip())
+            code = "\n".join(fixed)
+            try:
+                compile(code, "<input>", "exec")
+                return code
+            except SyntaxError:
+                pass
+
+    # If nothing worked, return the dedented version and let the caller
+    # report the real error
+    return textwrap.dedent("\n".join(lines))
+
+
+def _exec_python(code_str, namespace, last_exec=None):
+    """Execute Python code - try eval first (for expressions), fall back to exec.
+
+    If last_exec dict is provided, stores the last code and error for ai debug.
+    """
     from ..utils.output import print_json
+
+    # Clean up pasted code: strip trailing whitespace and fix indentation
+    code_str = _clean_pasted_code(code_str)
+
+    if last_exec is not None:
+        last_exec["code"] = code_str
+        last_exec["error"] = None
 
     try:
         result = eval(compile(code_str, "<input>", "eval"), namespace)
@@ -454,8 +561,14 @@ def _exec_python(code_str, namespace):
         try:
             exec(compile(code_str, "<input>", "exec"), namespace)
         except Exception:
+            error_str = traceback.format_exc()
+            if last_exec is not None:
+                last_exec["error"] = error_str
             traceback.print_exc()
     except Exception:
+        error_str = traceback.format_exc()
+        if last_exec is not None:
+            last_exec["error"] = error_str
         traceback.print_exc()
 
 
@@ -651,6 +764,29 @@ def _build_namespace(config, session_manager):
         # In REPL mode, no registry — suggested commands are printed but not auto-executed
         cmd_ai(args, config, session_manager, registry=None)
 
+    def login(profile=None):
+        """Run aws sso login for the current or specified profile.
+
+        Examples:
+            login()              # login with current profile
+            login("staging")     # login with a specific profile
+        """
+        import subprocess as _sp
+        target = profile or config.profile
+        console.print(f"[cyan]Running:[/cyan] aws sso login --profile {target}")
+        try:
+            _sp.run(["aws", "sso", "login", "--profile", target], check=False)
+            try:
+                identity = session_manager.get_caller_identity()
+                console.print(f"[green]Logged in as:[/green] {identity['Arn']}")
+            except Exception:
+                console.print("[yellow]Login may still be in progress or credentials are not yet valid.[/yellow]")
+        except FileNotFoundError:
+            console.print(
+                "[bold red]Error:[/bold red] `aws` CLI not found.\n"
+                "Install it from: [cyan]https://aws.amazon.com/cli/[/cyan]"
+            )
+
     namespace.update({
         "__builtins__": __builtins__,
         "boto3": boto3,
@@ -665,6 +801,7 @@ def _build_namespace(config, session_manager):
         "resource": get_resource,
         "set_region": set_region,
         "set_profile": set_profile,
+        "login": login,
         "ai": ai,
     })
 
@@ -1036,12 +1173,39 @@ def _attach_service_helpers(namespace, session_manager):
 
     # --- Lambda ---
     lam = ServiceHelper("lambda", sm.client("lambda"))
-    lam.list_functions = _paginated_helper(sm, "lambda", "list_functions", "Functions",
-        columns=[("FunctionName", "Function"), ("Runtime", "Runtime"),
-                 ("MemorySize", "Memory MB"), ("Timeout", "Timeout"),
-                 ("LastModified", "Last Modified")],
-        title="Lambda Functions")
+
+    def _lambda_list_functions():
+        c = sm.client("lambda")
+        functions = []
+        for page in c.get_paginator("list_functions").paginate():
+            functions.extend(page.get("Functions", []))
+        for f in functions:
+            # Build a "Code" column: runtime for Zip, image repo for Image
+            if f.get("PackageType") == "Image":
+                # Extract short image tag from the full ECR URI if available
+                code_info = f.get("Code", {})
+                image_uri = code_info.get("ImageUri", "") if isinstance(code_info, dict) else ""
+                if not image_uri:
+                    # ImageUri is in Code from get_function, not list_functions
+                    # For list_functions, just show "Container Image"
+                    f["_Code"] = "Container Image"
+                else:
+                    f["_Code"] = image_uri.split("/")[-1] if "/" in image_uri else image_uri
+            else:
+                f["_Code"] = f.get("Runtime", "")
+        return ResourceTable(functions, columns=[
+            ("FunctionName", "Function", "cyan"),
+            ("_Code", "Runtime / Image", "yellow"),
+            ("PackageType", "Package"),
+            ("MemorySize", "Memory MB"),
+            ("Timeout", "Timeout"),
+            ("Description", "Description"),
+            ("LastModified", "Last Modified"),
+        ], title="Lambda Functions")
+
+    lam.list_functions = _lambda_list_functions
     namespace["lam"] = lam
+    namespace["aws_lambda"] = lam
 
     # --- CloudFormation ---
     cfn = ServiceHelper("cfn", sm.client("cloudformation"))

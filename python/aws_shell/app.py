@@ -5,6 +5,8 @@ import threading
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
@@ -26,6 +28,16 @@ class AWSShell:
         self.completer = build_completer(self.registry, self.session_manager)
 
         history_path = os.path.expanduser("~/.aws_shell_history")
+
+        bindings = KeyBindings()
+
+        @bindings.add(Keys.Escape, eager=True)
+        def _handle_escape(event):
+            """Dismiss the completion menu on Escape."""
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.cancel_completion()
+
         self.prompt_session = PromptSession(
             history=FileHistory(history_path),
             completer=self.completer,
@@ -33,6 +45,7 @@ class AWSShell:
             style=get_style(),
             auto_suggest=AutoSuggestFromHistory(),
             complete_while_typing=True,
+            key_bindings=bindings,
         )
 
         # Background-initialize AI conversation (loads docs + builds system prompt)
@@ -51,8 +64,11 @@ class AWSShell:
         t = threading.Thread(target=_init, daemon=True)
         t.start()
 
-    def run(self):
+    def run(self, start_in_python=False):
         show_welcome(self.config, self.session_manager)
+
+        if start_in_python:
+            self.registry.dispatch("py", [])
 
         while True:
             try:
