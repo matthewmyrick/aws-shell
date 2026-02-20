@@ -39,7 +39,7 @@ _NAMESPACE_NAMES = {
     "secrets", "dynamodb", "ssm_client", "ecs_client", "sso_admin",
     "cache", "cognito",
     # Utility functions
-    "find", "docs", "raw", "client", "resource", "set_region", "set_profile",
+    "find", "docs", "raw", "clear", "client", "resource", "set_region", "set_profile",
     "login", "ai",
 }
 
@@ -457,10 +457,19 @@ def _rewrite_shell_style(text):
     Converts e.g. ``ai how do I list EC2s`` to ``ai("how do I list EC2s")``.
     Only triggers when the line starts with a known function name followed by
     bare words (no parentheses).
+
+    Also supports pipe syntax for chaining:
+        expr | find("keyword")  →  find(expr, "keyword")
+        expr | docs             →  docs(expr)
+        expr | raw              →  raw(expr)
+        expr | keys             →  expr.keys()
+        expr | len              →  len(expr)
+        expr | json             →  expr.json() if ResourceTable, else print_json(expr)
     """
     import re
     stripped = text.strip()
-    # Match: ai <anything that doesn't start with ( >
+
+    # Handle ai shell-style rewrite first
     m = re.match(r'^ai\s+(?!\()(.*)', stripped)
     if m:
         arg = m.group(1)
@@ -470,6 +479,65 @@ def _rewrite_shell_style(text):
         # Escape any embedded quotes
         escaped = arg.replace('\\', '\\\\').replace('"', '\\"')
         return f'ai("{escaped}")'
+
+    # Handle pipe syntax: expr | func or expr | func(args)
+    stripped = _rewrite_pipe(stripped)
+
+    return stripped
+
+
+# Functions that can be used as pipe targets
+_PIPE_FUNCS = {"find", "docs", "raw", "print", "len", "type", "sorted", "list", "dict"}
+# Pipe targets that become attribute calls on the expression
+_PIPE_ATTRS = {"keys", "values", "items", "json", "help", "sort", "select", "filter", "data"}
+
+
+def _rewrite_pipe(text):
+    """Rewrite pipe syntax into Python calls.
+
+    Only rewrites when the right side of | matches a known pipe target
+    to avoid breaking actual bitwise OR operations.
+    """
+    import re
+
+    # Find the last | that looks like a pipe (surrounded by spaces)
+    # Use a simple approach: split on ' | ' from the right
+    pipe_match = re.search(r'\s*\|\s*(\w+(?:\(.*\))?)\s*$', text)
+    if not pipe_match:
+        return text
+
+    pipe_expr = pipe_match.group(1).strip()
+    left = text[:pipe_match.start()].strip()
+
+    if not left:
+        return text
+
+    # Parse the right side: func_name and optional (args)
+    m = re.match(r'^(\w+)(?:\((.*)\))?$', pipe_expr, re.DOTALL)
+    if not m:
+        return text
+
+    func_name = m.group(1)
+    func_args = m.group(2)  # None if no parens, "" if empty parens, or "args"
+
+    # Check if it's a known pipe target
+    if func_name in _PIPE_ATTRS:
+        # Attribute/method call on the expression
+        if func_args is not None:
+            return f'({left}).{func_name}({func_args})'
+        else:
+            # .data is a property, .keys() etc are methods
+            if func_name in ("data",):
+                return f'({left}).{func_name}'
+            return f'({left}).{func_name}()'
+    elif func_name in _PIPE_FUNCS:
+        # Wrap: func(expr, args) or func(expr)
+        if func_args is not None and func_args.strip():
+            return f'{func_name}({left}, {func_args})'
+        else:
+            return f'{func_name}({left})'
+
+    # Not a known pipe target — leave as-is (it's probably bitwise OR)
     return text
 
 
@@ -748,6 +816,10 @@ def _build_namespace(config, session_manager):
         for arg in args:
             _original_print(repr(arg))
 
+    def clear():
+        """Clear the terminal screen."""
+        os.system("clear" if os.name != "nt" else "cls")
+
     def ai(question):
         """Ask the AI assistant a question about AWS.
 
@@ -795,6 +867,7 @@ def _build_namespace(config, session_manager):
         # Utility functions
         "print": smart_print,
         "raw": raw,
+        "clear": clear,
         "find": find,
         "docs": docs,
         "client": get_client,
