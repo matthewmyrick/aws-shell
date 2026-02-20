@@ -39,7 +39,7 @@ _NAMESPACE_NAMES = {
     "secrets", "dynamodb", "ssm_client", "ecs_client", "sso_admin",
     "cache", "cognito",
     # Utility functions
-    "find", "docs", "raw", "clear", "client", "resource", "set_region", "set_profile",
+    "find", "docs", "help", "raw", "clear", "client", "resource", "set_region", "set_profile",
     "login", "ai",
 }
 
@@ -158,6 +158,31 @@ _TABLE_METHODS = {
 }
 
 
+def _get_boto3_params(client, method_name):
+    """Get parameter names and required flags for a boto3 method from botocore.
+
+    Returns list of (param_name, is_required, type_name) tuples, or None if not found.
+    """
+    try:
+        api_mapping = client.meta.method_to_api_mapping
+        op_name = api_mapping.get(method_name)
+        if not op_name:
+            return None
+        service_model = client.meta.service_model
+        op_model = service_model.operation_model(op_name)
+        input_shape = op_model.input_shape
+        if not input_shape or not input_shape.members:
+            return []
+        required = set(input_shape.required_members) if hasattr(input_shape, 'required_members') else set()
+        params = []
+        for name, shape in input_shape.members.items():
+            type_name = shape.type_name
+            params.append((name, name in required, type_name))
+        return params
+    except Exception:
+        return None
+
+
 class PythonCompleter(Completer):
     """Auto-completer that handles pre-loaded variables and Python attribute access."""
 
@@ -166,6 +191,12 @@ class PythonCompleter(Completer):
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+
+        # Check if we're inside a function call — complete kwargs
+        kwargs_result = self._try_complete_kwargs(text)
+        if kwargs_result is not None:
+            yield from kwargs_result
+            return
 
         # Extract the current word being typed (the dotted expression at cursor)
         word = self._get_expression_at_cursor(text)
@@ -257,6 +288,73 @@ class PythonCompleter(Completer):
                     )
                 else:
                     yield Completion(name, start_position=-len(partial))
+
+    def _try_complete_kwargs(self, text):
+        """If cursor is inside a method call on a ServiceHelper, suggest kwargs.
+
+        Detects patterns like: ec2.describe_instances(  or  ec2.describe_instances(Inst
+        Returns an iterable of Completions, or None if not applicable.
+        """
+        import re
+
+        # Find the last unmatched ( — we might be inside a function call
+        depth = 0
+        paren_pos = -1
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] == ')':
+                depth += 1
+            elif text[i] == '(':
+                if depth == 0:
+                    paren_pos = i
+                    break
+                depth -= 1
+        if paren_pos < 0:
+            return None
+
+        # Extract what's before the ( — should be like "ec2.describe_instances"
+        before_paren = text[:paren_pos].rstrip()
+        m = re.match(r'.*?(\w+)\.(\w+)$', before_paren)
+        if not m:
+            return None
+
+        obj_name = m.group(1)
+        method_name = m.group(2)
+
+        # Check if obj_name is a ServiceHelper in the namespace
+        obj = self.namespace.get(obj_name)
+        if not isinstance(obj, ServiceHelper):
+            return None
+
+        # Get params from botocore
+        params = _get_boto3_params(obj._client, method_name)
+        if params is None:
+            return None
+
+        # Figure out what the user has typed so far after the last , or (
+        inside_parens = text[paren_pos + 1:]
+        # Get the partial word being typed (after last comma or open paren)
+        partial_match = re.search(r'(?:,\s*|^\s*)(\w*)$', inside_parens)
+        partial = partial_match.group(1) if partial_match else ""
+        partial_lower = partial.lower()
+
+        # Find already-used kwargs to exclude them
+        used_kwargs = set(re.findall(r'(\w+)\s*=', inside_parens))
+
+        completions = []
+        for param_name, is_required, type_name in params:
+            if param_name in used_kwargs:
+                continue
+            if partial_lower and not param_name.lower().startswith(partial_lower):
+                continue
+            meta = f"{'required ' if is_required else ''}{type_name}"
+            completions.append(Completion(
+                param_name + "=",
+                start_position=-len(partial),
+                display=param_name + "=",
+                display_meta=meta,
+            ))
+
+        return completions if completions else None
 
     @staticmethod
     def _complete_table_methods(partial):
@@ -487,9 +585,9 @@ def _rewrite_shell_style(text):
 
 
 # Functions that can be used as pipe targets
-_PIPE_FUNCS = {"find", "docs", "raw", "print", "len", "type", "sorted", "list", "dict"}
+_PIPE_FUNCS = {"find", "docs", "help", "raw", "print", "len", "type", "sorted", "list", "dict"}
 # Pipe targets that become attribute calls on the expression
-_PIPE_ATTRS = {"keys", "values", "items", "json", "help", "sort", "select", "filter", "data"}
+_PIPE_ATTRS = {"keys", "values", "items", "json", "sort", "select", "filter", "data"}
 
 
 def _rewrite_pipe(text):
@@ -713,8 +811,31 @@ def _build_namespace(config, session_manager):
             console.print(text)
         console.print(f"\n[dim]{len(results)} match(es)[/dim]")
 
-    def docs(obj=None):
-        """Show documentation for a client, function, or method."""
+    # Categories for grouping boto3 methods
+    _METHOD_CATEGORIES = [
+        ("list",     ["list_", "get_paginator"]),
+        ("describe", ["describe_", "get_"]),
+        ("create",   ["create_", "put_", "add_", "register_", "import_"]),
+        ("update",   ["update_", "modify_", "set_", "replace_", "enable_", "disable_"]),
+        ("delete",   ["delete_", "remove_", "deregister_", "terminate_", "stop_", "revoke_"]),
+        ("other",    []),
+    ]
+
+    def docs(obj=None, filter_keyword=None):
+        """Show documentation for a client, function, or method.
+
+        Args:
+            obj: A client, function, or None for overview.
+            filter_keyword: Filter boto3 methods by category or substring.
+                Categories: list, describe, create, update, delete
+                Or any string to search method names.
+
+        Examples:
+            docs()                  # overview of all clients
+            docs(ec2)               # ec2 helpers + all boto3 methods grouped
+            docs(ec2, "list")       # only list/get methods for ec2
+            ec2 | help("describe")  # same via pipe
+        """
         from rich.panel import Panel
         from rich.table import Table as RichTable
 
@@ -741,7 +862,9 @@ def _build_namespace(config, session_manager):
                 "[bold]Utilities:[/bold]\n"
                 "  [cyan]find(data, kw)[/cyan]    Fuzzy search through any data\n"
                 "  [cyan]docs()[/cyan]            Show this overview\n"
-                "  [cyan]docs(ec2)[/cyan]         Show helpers for a client\n"
+                "  [cyan]docs(ec2)[/cyan]         Show helpers + grouped boto3 methods\n"
+                "  [cyan]docs(ec2, 'list')[/cyan] Filter by category (list/describe/create/update/delete)\n"
+                "  [cyan]ec2 | help('list')[/cyan] Same via pipe syntax\n"
                 "  [cyan]docs(find)[/cyan]        Show docs for a function\n"
                 "  [cyan]client(name)[/cyan]      Get any boto3 client\n"
                 "  [cyan]resource(name)[/cyan]    Get any boto3 resource\n"
@@ -749,31 +872,93 @@ def _build_namespace(config, session_manager):
                 "  [cyan]set_profile(name)[/cyan] Switch profile\n\n"
                 "[bold]Table Methods[/bold] (call [cyan].help()[/cyan] on any table):\n"
                 "  [cyan].filter()[/cyan] [cyan].find()[/cyan] [cyan].sort()[/cyan] "
-                "[cyan].select()[/cyan] [cyan].data[/cyan] [cyan].json()[/cyan] [cyan].help()[/cyan]",
+                "[cyan].select()[/cyan] [cyan].data[/cyan] [cyan].json()[/cyan] [cyan].help()[/cyan]\n\n"
+                "[bold]Pipe Syntax:[/bold]\n"
+                "  [cyan]expr | find('kw')[/cyan]  [cyan]expr | docs[/cyan]  "
+                "[cyan]expr | keys[/cyan]  [cyan]expr | raw[/cyan]  [cyan]expr | len[/cyan]",
                 title="Quick Reference",
                 border_style="green",
             ))
             return
 
         if isinstance(obj, ServiceHelper):
-            # Show client helpers
+            # Get all boto3 client methods
+            client_methods = sorted(
+                a for a in dir(obj._client)
+                if not a.startswith('_') and callable(getattr(obj._client, a, None))
+                and a not in ("can_paginate", "generate_presigned_url", "get_waiter", "get_paginator", "exceptions", "meta")
+            )
+
+            # Show helper methods first
             helpers = sorted(
                 k for k in obj.__dict__
                 if not k.startswith('_') and callable(obj.__dict__[k])
             )
             lines = [f"[bold]{obj._name}[/bold] client\n"]
-            if helpers:
-                lines.append("[bold]Helper methods:[/bold]")
+            if helpers and not filter_keyword:
+                lines.append("[bold green]Helper methods:[/bold green]")
                 for h in helpers:
                     func = obj.__dict__[h]
                     doc = (func.__doc__ or "").strip().split("\n")[0]
                     lines.append(f"  [cyan]{obj._name}.{h}()[/cyan]  {doc}")
-            lines.append(f"\n[bold]Direct boto3 methods:[/bold]")
-            lines.append(f"  [dim]All {obj._name}.* boto3 methods work too, e.g.:[/dim]")
-            client_methods = [a for a in dir(obj._client) if not a.startswith('_') and callable(getattr(obj._client, a, None))]
-            sample = client_methods[:8]
-            lines.append(f"  [dim]{', '.join(sample)}{'...' if len(client_methods) > 8 else ''}[/dim]")
-            console.print(Panel("\n".join(lines), title=f"docs({obj._name})", border_style="cyan"))
+                lines.append("")
+
+            if filter_keyword:
+                # Check if it's a known category name
+                kw = filter_keyword.lower()
+                category_prefixes = None
+                for cat_name, prefixes in _METHOD_CATEGORIES:
+                    if cat_name == kw:
+                        category_prefixes = prefixes
+                        break
+
+                if category_prefixes is not None:
+                    # Filter by category prefixes
+                    matched = [m for m in client_methods if any(m.startswith(p) for p in category_prefixes)]
+                    if matched:
+                        lines.append(f"[bold yellow]{kw}[/bold yellow] methods:")
+                        for m in matched:
+                            lines.append(f"  [cyan]{obj._name}.{m}()[/cyan]")
+                    else:
+                        lines.append(f"[dim]No '{kw}' methods found[/dim]")
+                else:
+                    # Substring search
+                    matched = [m for m in client_methods if kw in m.lower()]
+                    # Also check helpers
+                    matched_helpers = [h for h in helpers if kw in h.lower()]
+                    if matched_helpers:
+                        lines.append(f"[bold green]Matching helpers:[/bold green]")
+                        for h in matched_helpers:
+                            lines.append(f"  [cyan]{obj._name}.{h}()[/cyan]")
+                        lines.append("")
+                    if matched:
+                        lines.append(f"[bold yellow]Matching boto3 methods:[/bold yellow]")
+                        for m in matched:
+                            lines.append(f"  [cyan]{obj._name}.{m}()[/cyan]")
+                    if not matched and not matched_helpers:
+                        lines.append(f"[dim]No methods matching '{filter_keyword}'[/dim]")
+            else:
+                # Group all methods by category
+                categorized = set()
+                for cat_name, prefixes in _METHOD_CATEGORIES:
+                    if cat_name == "other":
+                        continue
+                    matched = [m for m in client_methods if any(m.startswith(p) for p in prefixes)]
+                    if matched:
+                        lines.append(f"[bold yellow]{cat_name}[/bold yellow]")
+                        for m in matched:
+                            lines.append(f"  [dim]{obj._name}.{m}()[/dim]")
+                            categorized.add(m)
+                        lines.append("")
+
+                uncategorized = [m for m in client_methods if m not in categorized]
+                if uncategorized:
+                    lines.append("[bold yellow]other[/bold yellow]")
+                    for m in uncategorized:
+                        lines.append(f"  [dim]{obj._name}.{m}()[/dim]")
+
+            title = f"docs({obj._name})" if not filter_keyword else f"docs({obj._name}, '{filter_keyword}')"
+            console.print(Panel("\n".join(lines), title=title, border_style="cyan"))
             return
 
         if isinstance(obj, ResourceTable):
@@ -788,8 +973,25 @@ def _build_namespace(config, session_manager):
                 sig = str(inspect.signature(obj))
             except (ValueError, TypeError):
                 sig = "(...)"
+
+            lines = [f"[bold cyan]{name}[/bold cyan][dim]{sig}[/dim]\n\n{doc}"]
+
+            # If this is a boto3 method wrapper from ServiceHelper, show params
+            # Check if the function has a __name__ that maps to a boto3 operation
+            func_name = getattr(obj, '__name__', '')
+            # Try to find the client this method belongs to by checking namespace
+            for ns_name, ns_val in namespace.items():
+                if isinstance(ns_val, ServiceHelper):
+                    boto3_params = _get_boto3_params(ns_val._client, func_name)
+                    if boto3_params is not None:
+                        lines.append("\n[bold]Parameters:[/bold]")
+                        for pname, is_req, type_name in boto3_params:
+                            req_tag = " [bold red](required)[/bold red]" if is_req else ""
+                            lines.append(f"  [cyan]{pname}[/cyan] [dim]{type_name}[/dim]{req_tag}")
+                        break
+
             console.print(Panel(
-                f"[bold cyan]{name}[/bold cyan][dim]{sig}[/dim]\n\n{doc}",
+                "\n".join(lines),
                 title=f"docs({name})",
                 border_style="cyan",
             ))
@@ -870,6 +1072,7 @@ def _build_namespace(config, session_manager):
         "clear": clear,
         "find": find,
         "docs": docs,
+        "help": docs,
         "client": get_client,
         "resource": get_resource,
         "set_region": set_region,
