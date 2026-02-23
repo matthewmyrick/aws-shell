@@ -56,6 +56,35 @@ _ID_PATTERN = re.compile(r"^(i|vpc|subnet|sg|vol|snap|ami|rtb|igw|nat|eni|acl)-[
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
+def _collect_filter_keys(data, columns=None):
+    """Collect available filter keys from data, separated into tag keys and field keys."""
+    tag_keys = set()
+    field_keys = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for k, v in item.items():
+            if k == "Tags" and isinstance(v, list):
+                for tag in v:
+                    if isinstance(tag, dict) and "Key" in tag:
+                        tag_keys.add(tag["Key"])
+            elif isinstance(v, dict):
+                for sub_k in v:
+                    field_keys.add(f"{k}.{sub_k}")
+            else:
+                field_keys.add(k)
+    # If columns are defined, show those first as the primary keys
+    column_keys = []
+    if columns:
+        for col in columns:
+            col_key = col[0] if isinstance(col, (list, tuple)) else col
+            if col_key.startswith("Tags."):
+                tag_keys.add(col_key[5:])
+            else:
+                column_keys.append(col_key)
+    return column_keys, tag_keys, field_keys
+
+
 def _get_value(item, key):
     """Get a value from a dict, handling nested keys and AWS Tags.
 
@@ -333,6 +362,30 @@ class ResourceTable:
                 has_suffix_star = value_str.endswith("*")
                 # Strip wildcards for the actual comparison value
                 match_val = value_lower.lstrip("*").rstrip("*")
+
+                # Check if the key exists in any item (direct, nested, or Tags)
+                key_found = False
+                for item in filtered:
+                    if not isinstance(item, dict):
+                        continue
+                    item_val = _get_value(item, key)
+                    if item_val is None:
+                        item_val = _get_value(item, f"Tags.{key}")
+                    if item_val is not None:
+                        key_found = True
+                        break
+
+                if not key_found and filtered:
+                    col_keys, tag_keys, field_keys = _collect_filter_keys(filtered, self._columns)
+                    console.print(f"[yellow]Unknown filter key:[/yellow] [bold]{key}[/bold]")
+                    if col_keys:
+                        console.print(f"[dim]Column keys: {', '.join(sorted(col_keys))}[/dim]")
+                    if tag_keys:
+                        console.print(f"[dim]Tag keys (auto-resolved): {', '.join(sorted(tag_keys))}[/dim]")
+                    if field_keys - set(col_keys):
+                        other = sorted(field_keys - set(col_keys))
+                        console.print(f"[dim]Other fields: {', '.join(other)}[/dim]")
+                    return ResourceTable([], columns=self._columns, title=self._title)
 
                 for item in filtered:
                     if not isinstance(item, dict):
