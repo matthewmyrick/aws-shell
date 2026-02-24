@@ -36,6 +36,7 @@ class CommandRegistry:
         from .sso import register as register_sso
         from .cache import register as register_cache
         from .cognito import register as register_cognito
+        from .kms import register as register_kms
         from .vpc import register as register_vpc
         from .search_cmd import register as register_search
         from .ai_cmd import register as register_ai
@@ -64,6 +65,7 @@ class CommandRegistry:
         register_sso(self)
         register_cache(self)
         register_cognito(self)
+        register_kms(self)
         register_vpc(self)
         register_search(self)
         register_ai(self)

@@ -143,6 +143,14 @@ The shell maintains a current **profile**, **region**, and **output format** (ta
 - `cognito list-users <pool-id>` — List users in a pool
 - `cognito get-config <pool-id>` — Get pool config as JSON
 
+### KMS
+- `kms list-keys` — List all KMS keys with aliases
+- `kms describe-key <key-id-or-alias>` — Show key details
+- `kms list-aliases [key-id]` — List key aliases (optionally filter by key)
+- `kms get-key-policy <key-id-or-alias>` — Show the key policy
+- `kms get-public-key <key-id-or-alias> [output-file]` — Download public key (asymmetric only)
+- `kms get-config <key-id-or-alias>` — Get full key config as JSON (metadata, policy, aliases, grants)
+
 ### Fuzzy Search
 - `search <service> <id> <keyword>` — Search a resource's JSON config for a keyword
 
@@ -214,6 +222,7 @@ Each client wraps a boto3 client and exposes helper methods that return rich tab
 | `sso_admin` | SSO Admin | `list_permission_sets()`, `get_policy(name)`, `list_managed_policies(name)`, `list_account_assignments(name)` |
 | `cache` | ElastiCache | `list_clusters()`, `list_replication_groups()`, `list_serverless()` |
 | `cognito` | Cognito | `list_user_pools()` |
+| `kms` | KMS | `list_keys()`, `list_aliases()` |
 
 All direct boto3 client methods also work and auto-wrap responses in rich tables.
 

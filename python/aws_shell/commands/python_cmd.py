@@ -37,7 +37,7 @@ _NAMESPACE_NAMES = {
     "ec2", "vpc", "asg", "s3", "iam", "lam", "aws_lambda", "cfn", "sts", "rds", "sqs", "ses",
     "opensearch", "route53", "ga_client", "cloudfront", "cw", "logs",
     "secrets", "dynamodb", "ssm_client", "ecs_client", "sso_admin",
-    "cache", "cognito",
+    "cache", "cognito", "kms",
     # Utility functions
     "find", "docs", "help", "raw", "clear", "client", "resource", "set_region", "set_profile",
     "login", "ai",
@@ -409,7 +409,7 @@ def cmd_python(args, config, session_manager):
             "  [cyan]route53[/cyan], [cyan]ga_client[/cyan], [cyan]cloudfront[/cyan], "
             "[cyan]cw[/cyan], [cyan]logs[/cyan], [cyan]secrets[/cyan], [cyan]dynamodb[/cyan],\n"
             "  [cyan]ssm_client[/cyan], [cyan]ecs_client[/cyan], [cyan]sso_admin[/cyan], "
-            "[cyan]cache[/cyan], [cyan]cognito[/cyan]\n\n"
+            "[cyan]cache[/cyan], [cyan]cognito[/cyan], [cyan]kms[/cyan]\n\n"
             "[bold]Examples:[/bold]\n"
             "  [cyan]ec2.list_instances()[/cyan]                    "
             "[dim]# Rich table output[/dim]\n"
@@ -1827,6 +1827,63 @@ def _attach_service_helpers(namespace, session_manager):
 
     cognito.list_user_pools = _cog_list_user_pools
     namespace["cognito"] = cognito
+
+    # --- KMS ---
+    kms = ServiceHelper("kms", sm.client("kms"))
+
+    def _kms_list_keys():
+        c = sm.client("kms")
+        # Build alias map for display
+        alias_map = {}
+        for page in c.get_paginator("list_aliases").paginate():
+            for alias in page.get("Aliases", []):
+                key_id = alias.get("TargetKeyId", "")
+                if key_id:
+                    alias_map.setdefault(key_id, []).append(alias.get("AliasName", ""))
+
+        keys = []
+        for page in c.get_paginator("list_keys").paginate():
+            for key in page.get("Keys", []):
+                key_id = key["KeyId"]
+                try:
+                    detail = c.describe_key(KeyId=key_id).get("KeyMetadata", {})
+                except Exception:
+                    detail = {}
+                keys.append({
+                    "KeyId": key_id,
+                    "_Aliases": ", ".join(alias_map.get(key_id, [])) or "-",
+                    "Description": detail.get("Description", ""),
+                    "KeyState": detail.get("KeyState", ""),
+                    "KeyUsage": detail.get("KeyUsage", ""),
+                    "Origin": detail.get("Origin", ""),
+                })
+
+        return ResourceTable(keys, columns=[
+            ("KeyId", "Key ID", "cyan"),
+            ("_Aliases", "Aliases", "green"),
+            ("Description", "Description"),
+            ("KeyState", "State", "bold"),
+            ("KeyUsage", "Usage", "yellow"),
+            ("Origin", "Origin"),
+        ], title="KMS Keys")
+
+    def _kms_list_aliases(key_id=None):
+        c = sm.client("kms")
+        aliases = []
+        for page in c.get_paginator("list_aliases").paginate():
+            for alias in page.get("Aliases", []):
+                if key_id and key_id not in alias.get("TargetKeyId", ""):
+                    continue
+                aliases.append(alias)
+        return ResourceTable(aliases, columns=[
+            ("AliasName", "Alias", "cyan"),
+            ("TargetKeyId", "Target Key ID", "green"),
+            ("AliasArn", "ARN"),
+        ], title="KMS Aliases")
+
+    kms.list_keys = _kms_list_keys
+    kms.list_aliases = _kms_list_aliases
+    namespace["kms"] = kms
 
 
 def _refresh_clients(namespace, session_manager):
